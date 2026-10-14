@@ -32,6 +32,10 @@ dsh plugin --profile web add github:<你的用户名>/<仓库名>
 
 设置 → 插件 → 安装 → 填上面的路径或 git 形式（同一个安装器）。
 
+托管竞赛不要等模型敲 `/fgs new` 或调用 `fgs_project`。镜像启动后由
+`contest/entrypoint.sh` 在任何模型回合之前把题种到磁盘，见
+[TSecBench contest entry](#tsecbench-contest-entry)。
+
 装完**即生效（DSH 对 profile 热加载，无需重启）**。安装器会做两件事：把包写进 profile 的
 `dependencies`，并**自动把它加入 `dsh.profile.bundles`**（这一步是关键——只加 `dependencies`
 而不进 `bundles`，插件 overlay 不生效、**插件会静默不加载**）。
@@ -140,6 +144,8 @@ fixtures/                   # golden：origin-only / mid-graph / post-satisfy
 io-specs/                   # LLM 工具 I/O 预制规范
 schemas/tools/              # Decide/Execute 工具 JSON Schema
 prompts/                    # Decide/Execute 系统骨架；apply 时读入并注入 fgs-graph
+tools/                      # submit_flag.mjs（赛方提交）+ bootstrap_project.mjs（无 LLM 写盘种题）
+contest/                    # hosted 入口：entrypoint.sh + driver.py + Dockerfile 示例
 tests/                      # node --test（离线，无外部依赖）
 tests/fixtures/             # 含 fgs-v3-baseline.index.js（gen9 冻结基线，供对抗测试做集合差）
 docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES / FIXES.patch（历史记录，不参与运行）
@@ -228,6 +234,68 @@ verifyCommand: 'node /path/to/fgs-deepseek-dsh/tools/submit_flag.mjs'
 > 而真实竞赛的 flag 是 `flag{...}` 小写——**拿到真题的真 flag 也会被硬门拒收**，
 > 只有自己敲的 `FLAG{}` 假数据能过。这个问题是靠一份真实比赛会话导出（b-02）才暴露的。
 
+<a id="tsecbench-contest-entry"></a>
+
+## TSecBench contest entry（磁盘预种）
+
+托管评测是**一个 Agent 容器跑多题队列**（题目靶场另起，`start` 之后才有 `container_addr`，同时活跃约 **3** 题）。平台不替你敲 `/fgs new`，也不规定 ENTRYPOINT 写法；行为要求是：**镜像启动后自行开始解题**。只在 prompt 里写「必须 `fgs_project`」不够——网关丢 `function_call` 时整题没有黑板，Decide/Execute 会停在「未启动」。
+
+P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，用本仓库的写图器落盘。`attachRun` 看到 `fact_origin` 就自动认领，模型第一轮不必建题。
+
+### 环境契约
+
+| 变量 | 谁提供 | 说明 |
+|---|---|---|
+| `BENCHMARK_TOKEN` | 平台注入 | 缺则 `contest/entrypoint.sh` **exit 1**。不要写进镜像，也不要填在上传页 |
+| `BENCHMARK_BASE_URL` | 平台注入 | 同上 |
+| 模型 key / base URL | 上传页环境 | 运行时读取。镜像内剥离密钥 |
+| `SOLVER_GATEWAY=1` | 选手运行时 | 白名单模型基址改写：`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`（https→http，主机名后加 `.tsecbench.gw`）。托管沙箱没有公网。本地调试不要设 |
+| `CONTEST_VPN` | 可选，默认关 | integration 文档写访问题址要任务 VPN；托管上传页**没写**沙箱是否已内置 VPN。默认不阻塞预种。打开时还要 `CONTEST_VPN_CONFIG`（配置文件）和 `CONTEST_VPN_EXEC`（本骨架不内置 OpenVPN） |
+| `CONTEST_MAX_CONCURRENCY` | 可选，默认 3 | 超过 3 会被压到平台 max active |
+| `CONTEST_WORKDIR` | 可选 | 每题一个子目录。默认 `<仓库>/contest-work` |
+| `CONTEST_FIXTURE` | 离线 | 指向 challenges JSON，不访问平台。正式托管不要设 |
+| `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。竞赛 profile 必须走 **openai-completions**（responses 流式会丢 function_call） |
+| `BENCHMARK_API_PREFIX` | 可选 | 不设时 list/start 先试 `/api/v1`，再试 `/openapi/v1`（与 `tools/submit_flag.mjs` 的提交路径同族） |
+
+本地单题调试可以用 `FGS_PROBLEM_ID` / `FGS_BRIEF` / `FGS_WORKSPACE` 调 `bootstrap_project.mjs`。托管题面真源是 Challenges API 的 `unique_code` 和 `description`，不是这些变量。
+
+### 启动后的磁盘预种顺序
+
+`contest/entrypoint.sh` 校验 token 与 base URL，然后 exec `contest/driver.py`。driver 对每个未完成的 visit：
+
+1. `list_challenges`（跳过已通关）
+2. `start_challenge(unique_code)` → `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
+3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
+4. `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`
+5. 验收 `.fgs/competition.json` 的 `activeProblemId`，以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。不过则不拉 dsh
+6. 拉起 dsh（cwd = 该目录）。harness 未装时写 launch stub
+
+写盘复用 `ProjectRegistry`、`GraphStore`、`Controller.apply(seedOriginOp)`，不另造图格式。有 `target` 时 origin 正文与 `/fgs new` 一样是 `{target, brief}` 的 JSON。已有 `fact_origin` + `goal_final` 时第二次调用 **幂等成功**，不覆盖图（之后 Decide 写下的 step 还在）。缺 brief、id 非法、cwd 不可写则 exit 1。
+
+```bash
+node tools/bootstrap_project.mjs \
+  --cwd /tmp/work/a-10 \
+  --problem-id a-10 \
+  --brief '题面……' \
+  --target 'http://10.0.0.8:8080'
+```
+
+stdout 一行 JSON：`status` 为 `seeded` 或 `already-seeded`。
+
+### 镜像
+
+示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。dsh 需要在正式镜像里另装；这个示例只保证容器一起来就跑 entrypoint，并在 dsh 之前把 FGS 种上。
+
+```bash
+docker build -f contest/Dockerfile -t fgs-contest .
+```
+
+离线验收（无模型、无平台）：
+
+```bash
+node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs
+```
+
 ## 契约对照
 
 | CONTRACT | 落点 |
@@ -251,14 +319,15 @@ cd <插件目录>            # 你 clone / 解压出来的仓库根目录
 node --test "tests/*.test.mjs"
 ```
 
-离线、零依赖，直接跑即可（本机实测 **198 tests / 198 pass**）。基线对比用的 gen9 源码已作为
+离线、零依赖，直接跑即可（本机实测 **228 tests / 228 pass**）。基线对比用的 gen9 源码已作为
 `tests/fixtures/fgs-v3-baseline.index.js` 收进仓库，所以**不需要任何仓库外的兄弟目录**。
 
 覆盖：Project 建题/切换/列表、两题图与草稿隔离、旧单图迁移、无活动 Project 时拒改图、YAML 往返与真实 `cordis.patch.yml`、Controller 全部拒写路径（空 `from` /
 缺 `reason` / 缺 `satisfy_goal` 字段 / 超长 fact / 无 `producedBy` / 非 open step /
 FLAG verify 失败不落盘 / reopen 清空且不删历史）、角色隔离与 Decide 白名单、回合语义
 （一轮一个 step、回合收口强制观察 Fact）、显式 stepId 不许换 step、`/fgs` 命令、
-运行时上下文与 io-specs 注入、出参截断、HTTP 快照按会话取图、固定 JSON 轨迹离线 replay。
+运行时上下文与 io-specs 注入、出参截断、HTTP 快照按会话取图、固定 JSON 轨迹离线 replay、
+无 LLM 磁盘预种（含重复 bootstrap 幂等）以及 contest fixture 的 list→start→预种顺序。
 
 `tests/contract_fixes.test.mjs` 是对抗性审计发现项的回归：审计用哪一招打进来，就用哪一招锁回去。
 
