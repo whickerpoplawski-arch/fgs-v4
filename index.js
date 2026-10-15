@@ -83,6 +83,13 @@ const DECIDE_TOOLS = [
   'fgs_reopen',
 ];
 const EXECUTE_TOOLS = ['fgs_submit_fact', 'fgs_commit_step'];
+/** deferred 之后不得再进入 Execute 的图工具。fgs_commit 另看操作里有没有 open/claim。 */
+const EXECUTE_ENTRY_TOOLS = new Set([
+  'fgs_open_step',
+  'fgs_claim_step',
+  'fgs_submit_fact',
+  'fgs_commit_step',
+]);
 
 /**
  * v2（Cairn_Y）：Decide 的职责是「在一个任务开始时，或者图上信息有增加或者变化时」
@@ -897,16 +904,14 @@ function pickScheduleTarget(registry) {
 function scheduleHeader(next) {
   if (!next) return 'schedule: none';
   if (next.wave === 'cleanup') {
-    return `schedule: next=${next.id} wave=cleanup（没有非 deferred 可做题，允许收尾调度）`;
+    return `schedule: next=${next.id} wave=cleanup（没有非 deferred 可做题；Execute 已停止，不得再进入）`;
   }
   return `schedule: next=${next.id} wave=primary（跳过 deferred，不自动认领/切换到 deferred）`;
 }
 
 function scheduleTag(view, next) {
   if (!view || view.solved || view.state === 'created') return '';
-  if (view.deferred) {
-    return next?.wave === 'cleanup' && next.id === view.id ? ' schedule=now' : ' schedule=later';
-  }
+  if (view.deferred) return ' schedule=stopped';
   if (view.workable) return ' schedule=now';
   return '';
 }
@@ -955,7 +960,9 @@ function contextScheduleNote(registry, run, graph) {
     parts.push(`【调度】${scheduleHeader(next)}`);
     const current = views.find((view) => view.id === run?.problemId);
     if (current?.deferred && next?.wave === 'primary') {
-      parts.push('本题已 deferred：跳过自动认领/切换，先做非 deferred 题。');
+      parts.push('本题已 deferred：跳过自动认领/切换，先做非 deferred 题。不得在本题上 open_step / claim_step / 环境执行。');
+    } else if (current?.deferred) {
+      parts.push('本题已 deferred：Execute 已停止，不得再 open_step / claim_step / 环境执行。');
     }
   }
   const bodies = unfinishedLines(graph);
@@ -978,9 +985,61 @@ function appendScheduleLines(lines, registry, graph) {
   if (bodies) lines.push(bodies);
 }
 
+function deferredMetaOf(registry, problemId) {
+  if (!registry || !problemId) return null;
+  let meta = null;
+  try {
+    meta = registry.readMeta(problemId);
+  } catch {
+    return null;
+  }
+  return meta?.state === 'deferred' ? meta : null;
+}
+
+function commitWouldReenter(exec, run) {
+  const given = exec?.arguments?.operations;
+  const ops = Array.isArray(given) && given.length > 0 ? given : (run?.decideDraft ?? []);
+  return ops.some((op) => {
+    const kind = op?.op ?? op?.type;
+    return kind === 'open_step' || kind === 'claim_step';
+  });
+}
+
+/** deferred 题：拦住 Execute 入口和环境工具；只读 / 不重新认领的规划工具照旧。 */
+function deferredBlocksTool(tool, exec, run, registry, problemId) {
+  if (!deferredMetaOf(registry, problemId)) return false;
+  if (EXECUTE_ENTRY_TOOLS.has(tool)) return true;
+  if (tool === 'fgs_commit' && commitWouldReenter(exec, run)) return true;
+  if (PROJECT_TOOLS.includes(tool) || CONTROL_TOOLS.includes(tool)) return false;
+  if (GRAPH_TOOL_NAMES.includes(tool)) return false;
+  if (decideAllows(run?.cfg ?? {}, tool)) return false;
+  return true;
+}
+
+function deferredStopMessage(meta, tool) {
+  const reason = meta?.deferredReason || 'deferred';
+  return `FGS 本题已 deferred（reason=${reason}），拒绝 ${tool}：`
+    + 'Execute 会话已停止，不得再 open_step、claim_step、重新进入 Execute，也不得使用环境工具。';
+}
+
+/**
+ * 没有其它可做题时，用宿主已有的 concludeTurn 结束本会话（与 goal 满足同一钩子）。
+ * 不引入 supervisor 脚本。有别的可做题时只停这道 deferred 题，不结束会话。
+ */
+function stopIfDeferredSession(exec, registry, problemId) {
+  if (!deferredMetaOf(registry, problemId)) return;
+  const views = problemViews(registry);
+  if (views.some((view) => view.workable)) return;
+  if (typeof exec?.concludeTurn === 'function') exec.concludeTurn();
+}
+
 function markDeferred(registry, run, unfinishedFactId) {
   if (!registry || !run?.problemId) return;
   const prev = registry.readMeta(run.problemId) ?? {};
+  if (prev.state === 'deferred') {
+    registry.setProblemState(run.problemId, 'deferred');
+    return;
+  }
   const deferredAt = new Date().toISOString();
   registry.writeMeta(run.problemId, {
     id: run.problemId,
@@ -1329,7 +1388,21 @@ function registerTools(ctx, cfg, runs, registries, detached) {
   const register = (definition) => {
     disposers.push(ctx.tools.register(definition));
   };
-  const makeTool = (spec) => defineFgsTool({ ...spec, cfg });
+  const makeTool = (spec) => {
+    const definition = defineFgsTool({ ...spec, cfg });
+    const execute = definition.execute.bind(definition);
+    definition.execute = async (args, exec) => {
+      const result = await execute(args, exec);
+      try {
+        const { registry, problemId } = attachRun(exec?.agent, cfg, runs, registries, detached);
+        stopIfDeferredSession(exec, registry, problemId);
+      } catch {
+        /* 结束会话失败不得掩盖工具结果 */
+      }
+      return result;
+    };
+    return definition;
+  };
 
   const active = (exec) => {
     const run = runFor(exec?.agent, cfg, runs, registries, false);
@@ -1819,7 +1892,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
         // `openUnclaimed` 恒为 0；「未认领或租约过期的 step 可被任何会话认领」这句话
         // 在**图里没有任何一个未认领的 step**时是死条款，worker 一个任务都领不到，
         // 还要干等 stepLeaseMs(30min) 才可能接手。因此派发任务池时必须传 `claimOpened:false`。
-        // deferred 且还有非 deferred 题时，也不自动认领（显式 fgs_claim_step 仍可再进入）。
+        // deferred 题不自动认领。显式 open/claim 由 dispatch 门拒绝，这里是双保险。
         const openedRegistry = registryFor(exec?.agent, cfg, registries);
         const skipAutoClaim = shouldSkipAutoClaim(openedRegistry, run.problemId);
         const autoClaim = args.claimOpened !== false && !skipAutoClaim;
@@ -1840,10 +1913,13 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       if (satisfied && typeof exec?.concludeTurn === 'function') exec.concludeTurn();
       const openNow = openStepsOf(working);
       const nextProblem = commitRegistry ? pickScheduleTarget(commitRegistry) : null;
+      const deferredMeta = deferredMetaOf(commitRegistry, run.problemId);
       const tail = satisfied
         ? 'goal_final 已满足，停止。'
-        : (shouldSkipAutoClaim(commitRegistry, run.problemId) && nextProblem
-          ? `本题已 deferred，不自动认领。优先 ${nextProblem.id}（非 deferred 做完前不自动切到 deferred）。`
+        : (deferredMeta
+          ? (nextProblem && !nextProblem.deferred
+            ? `本题已 deferred（reason=${deferredMeta.deferredReason ?? 'deferred'}），不得再进入 Execute。优先 ${nextProblem.id}。`
+            : `本题已 deferred（reason=${deferredMeta.deferredReason ?? 'deferred'}），Execute 已停止，不得再 open_step / claim_step / 环境执行。`)
           : (openNow.length > 0
             ? `下一步进入 Execute：${openNow[0].id} [${openNow[0].priority}] ${openNow[0].action}`
             : '暂无 open step：继续 Decide。'));
@@ -2251,15 +2327,23 @@ export function apply(ctx, config = {}) {
     const tool = exec?.name;
     // 控制面：建题 / 换题 / 列题。没有活动 Project 时正是要用它，所以任何状态都放行。
     if (PROJECT_TOOLS.includes(tool)) return undefined;
-    const { problemId, run, reason } = activeRun(exec?.agent);
+    let attached = activeRun(exec?.agent);
     // 角色必须**每次都由 (图, 本会话) 现算**——缓存过的 run.role 会与图脱节，
     // 导致会话卡死、且 §4 的 Decide 环境工具禁令静默失效（详见 refreshRole 注释）。
-    if (run) {
+    if (attached.run) {
       try {
-        refreshRole(run);
+        refreshRole(attached.run);
       } catch {
         /* 图不可读时退回缓存角色，让后续读取路径自己报错 */
       }
+    }
+    // TTL 结算可能把活动题从 deferred 题切走；门禁看结算后的活动题。
+    attached = activeRun(exec?.agent);
+    const { problemId, run, reason, registry } = attached;
+    if (run && deferredBlocksTool(tool, exec, run, registry, problemId)) {
+      const meta = deferredMetaOf(registry, problemId);
+      stopIfDeferredSession(exec, registry, problemId);
+      return deferredStopMessage(meta, tool);
     }
     if (GRAPH_TOOL_NAMES.includes(tool)) {
       if (!problemId) {
