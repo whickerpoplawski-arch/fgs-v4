@@ -17,7 +17,9 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 3. **gc** — `monitor_sampler.sh loop` 的 `SESSION_ID` 不属于存活 worker 时杀掉。
 4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才从本 driver 的未完成队列启动下一题。任一护栏顶满都不派。列表失败时按活跃容器已满处理，不补派。
 
-队列空且没有存活 worker 时 driver 退出。`CONTEST_SUPERVISOR=0` 不进入循环，仍是一次性 list → start → 预种 → dsh。
+平台 list / start / close 的 HTTP 超时或连接中断只打 `contest:` 日志，driver 继续下一轮。close 没拿到响应时不写入已关集合，下一轮再试。close 超时不是失分（已经 submit 的分数还在）；这个异常如果冒出主循环，整条 launch/submit 流水线会停。
+
+队列空、没有待重试的 close、且没有存活 worker 时 driver 退出。列表失败不算队列空。`CONTEST_SUPERVISOR=0` 不进入循环，仍是一次性 list → start → 预种 → dsh。
 
 `contest/supervisor/autosup.sh` 是 `$RUN/workers/wN_<code>` 那套目录布局的手动入口，内部同样是 gc → retire → reap → 双护栏。它和 driver **不能同时补派**：谁先拿到 `$RUN/monitor/scheduler.lock`，另一方直接退出。entrypoint 不会启动 `autosup.sh`。
 
@@ -32,6 +34,7 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_RETIRE_GRACE` | `60` |
 | `CONTEST_RETIRE_GRACE_SOLVED` | `30` |
 | `CONTEST_SUPERVISOR_INTERVAL` | `20` |
+| `CONTEST_HTTP_TIMEOUT` | 不设时 close 为 20、driver 的 list/start 为 30。设置后三者共用，且必须是正数 |
 | `FGS_UNIQUE_CODE` | driver 按题注入 | 与 start/close 的 `unique_code` 相同。不要在上传页设成一个全局值。缺了则 `submit_flag.mjs` fail-closed，SCORE 不涨 |
 
 `CONTEST_SUPERVISOR_INTERVAL` 是 driver 循环和手动 `autosup` 两轮之间的休眠秒数。`0` 仍合法（不休眠）。别名 `GRACE` / `GRACE_SOLVED` 仍覆盖对应的 `CONTEST_RETIRE_*`。

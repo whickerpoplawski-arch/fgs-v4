@@ -297,6 +297,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_RETIRE_GRACE` | 默认 60 | deferred / 本地已 solved 的退休宽限（秒） |
 | `CONTEST_RETIRE_GRACE_SOLVED` | 默认 30 | 平台 `is_completed` 但本地 meta 还不是 solved 时的短宽限（秒） |
 | `CONTEST_SUPERVISOR_INTERVAL` | 默认 20 | driver 监管循环（以及手动 autosup）的轮询间隔（秒）。`0` 表示不休眠 |
+| `CONTEST_HTTP_TIMEOUT` | 可选 | 平台 list/start/close 的单次 HTTP 超时（秒）。不设时 close 为 20、driver 的 list/start 为 30。必须是正数。超时只记日志并在下一轮重试，不会让 driver 退出 |
 
 行为说明和竞赛推荐 env 见 [`contest/SUPERVISOR.md`](contest/SUPERVISOR.md)。Token 与 base URL 只在运行时注入，不要写进镜像。
 

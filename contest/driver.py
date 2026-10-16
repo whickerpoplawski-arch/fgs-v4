@@ -36,6 +36,11 @@ whose worker died, retire deferred/solved workers after grace, and start the
 next visit only when both alive workers and active containers are under
 CONTEST_MAX_ACTIVE. It does not exec contest/supervisor/autosup.sh (that is a
 second scheduler for the worker-directory layout).
+
+A platform list/start/close timeout or a dropped connection is logged and the
+loop keeps ticking. Close is retried on a later tick and is not recorded as
+done. ``CONTEST_HTTP_TIMEOUT`` bounds each call. A close timeout is not a lost
+score; an uncaught one stops launch and submit for the rest of the run.
 """
 
 from __future__ import annotations
@@ -48,22 +53,21 @@ import shutil
 import subprocess
 import sys
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from supervisor.core import (
+    PlatformTransportError,
     SupervisorError,
     acquire_lock,
     append_log,
     archive_worker,
-    attach_platform_headers,
     challenge_url,
     count_active,
     dispatch_budget,
     grace_settings,
+    http_timeout,
     injected_platform_hosts,
     list_samplers,
     load_closed_set,
@@ -74,6 +78,7 @@ from supervisor.core import (
     plan_retire,
     read_project_meta,
     release_lock,
+    request_json,
     solver_child_env,
     terminate_pid,
     utc_now,
@@ -356,19 +361,16 @@ def vpn_preflight() -> None:
 
 
 def _request(method: str, url: str, token: str, body: dict | None = None):
-    data = None if body is None else json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, method=method)
-    attach_platform_headers(req, token, json_body=body is not None)
+    """Platform HTTP used by list and start.
+
+    The default limit is 30s. ``CONTEST_HTTP_TIMEOUT`` overrides it, including
+    the close path in the supervisor. Transport failures become ``DriverError``
+    so a timeout cannot escape the visit or the supervisor loop.
+    """
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            raw = resp.read().decode("utf-8")
-            payload = json.loads(raw) if raw.strip() else {}
-            return resp.status, payload
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")[:300]
-        raise DriverError(f"HTTP {exc.code} {method} {url} {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise DriverError(f"request failed {method} {url}: {exc.reason}") from exc
+        return request_json(method, url, token, body, timeout=30)
+    except SupervisorError as exc:
+        raise DriverError(str(exc)) from exc
 
 
 def coerce_challenges(payload) -> list:
@@ -798,9 +800,16 @@ def remember_slot(result: dict) -> dict | None:
     }
 
 
-def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base: str, token: str) -> bool:
+def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base: str, token: str) -> str:
+    """Try to close ``code`` once.
+
+    Returns ``closed`` on success, ``retry`` when the platform never answered
+    (timeout or a dropped connection), ``failed`` on an HTTP answer we will
+    not pin the loop for, and ``skip`` when this code is already closed.
+    A failure is not written to the closed set, so a later tick can try again.
+    """
     if not code or code in already:
-        return False
+        return "skip"
     try:
         note = perform_close(
             run,
@@ -810,14 +819,24 @@ def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base:
             fixture=fixture_path or None,
             already=already,
         )
+    except PlatformTransportError as exc:
+        log(f"close {code} failed: {exc}; pending retry")
+        append_log(run, f"close {code} failed: {exc}; pending retry")
+        return "retry"
     except SupervisorError as exc:
         log(f"close {code} failed: {exc}")
         append_log(run, f"close {code} failed: {exc}")
-        return False
+        return "failed"
+    except OSError as exc:
+        # request_json already wraps TimeoutError. This is the belt so a raw
+        # timeout from urlopen still cannot kill the tick.
+        log(f"close {code} failed: {type(exc).__name__}: {exc}; pending retry")
+        append_log(run, f"close {code} failed: {type(exc).__name__}: {exc}; pending retry")
+        return "retry"
     if note is None:
-        return False
+        return "skip"
     log(f"close {code}")
-    return True
+    return "closed"
 
 
 def supervisor_interval() -> float:
@@ -857,6 +876,8 @@ def run_supervised(workdir: Path, token: str, base: str, fixture_path: str) -> i
 
 
 def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_path: str) -> int:
+    # A bad CONTEST_HTTP_TIMEOUT is configuration, not a platform blip.
+    http_timeout(30)
     interval = supervisor_interval()
     grace, grace_solved = grace_settings()
     cap = concurrency()
@@ -864,24 +885,54 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
     slots: list[dict] = []
     visits: list[dict] = []
     closed = load_closed_set(run)
+    pending_close: set[str] = set()
     prefix = None
     announced = False
 
+    def attempt_close(code: str) -> bool:
+        if not code or code in closed:
+            pending_close.discard(code)
+            return False
+        outcome = close_slot(run, code, closed, fixture_path, base, token)
+        if outcome == "retry":
+            pending_close.add(code)
+            return False
+        pending_close.discard(code)
+        return outcome == "closed"
+
     while True:
-        prefix, challenges, listed = load_challenge_snapshot(base, token, fixture_path)
-        if not announced:
+        list_failed = False
+        try:
+            prefix, challenges, listed = load_challenge_snapshot(base, token, fixture_path)
+        except (DriverError, SupervisorError, OSError) as exc:
+            # List used to raise out of this loop (TimeoutError is an OSError
+            # and was not a DriverError). An empty snapshot is not "no work":
+            # the platform may still be holding slots.
+            detail = exc if isinstance(exc, (DriverError, SupervisorError)) else f"{type(exc).__name__}: {exc}"
+            log(f"list challenges failed: {detail}")
+            append_log(run, f"list challenges failed: {detail}")
+            list_failed = True
+            challenges = []
+            listed = ""
+        if not announced and not list_failed:
             log(listed)
             pending, _workers = announce_schedule(challenges)
             announced = True
-            if not pending:
+            if not pending and not pending_close:
                 return 0
 
         views = [slot_view(slot) for slot in slots]
+        touched: set[str] = set()
         for action in plan_reap(challenges, views, already_closed=closed, include_dead_launched=True):
             if action["op"] == "keep":
                 append_log(run, f"keep {action['code']}")
                 continue
-            close_slot(run, action["code"], closed, fixture_path, base, token)
+            touched.add(action["code"])
+            attempt_close(action["code"])
+        for code in list(pending_close):
+            if code in touched or code in closed:
+                continue
+            attempt_close(code)
         slots = [slot for slot in slots if slot_view(slot)["alive"]]
 
         views = [slot_view(slot) for slot in slots]
@@ -895,7 +946,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 log(f"hold {action['code']} ({action['state']})")
                 continue
             terminate_pid(action.get("pid"))
-            close_slot(run, action["code"], closed, fixture_path, base, token)
+            attempt_close(action["code"])
             if action.get("archive") and action.get("dir"):
                 archive_worker(Path(action["dir"]))
             mark_retired(run, action["code"])
@@ -913,7 +964,8 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
         inflight = {slot.get("code") for slot in slots}
         queue = pending_queue(challenges, attempted, inflight)
         alive = sum(1 for slot in slots if slot_view(slot)["alive"])
-        active = count_active(challenges)
+        # Unknown list fails closed: do not start another container on a guess.
+        active = count_active(challenges, unknown=list_failed)
         budget = dispatch_budget(alive, active, cap, len(queue))
         append_log(run, f"alive_workers={alive} active_containers={active} queue_left={len(queue)}")
         log(f"supervisor tick alive={alive} active={active} queue={len(queue)} budget={budget}")
@@ -943,7 +995,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                     visits.append(result)
                     if not result.get("ok"):
                         if result.get("close") and result.get("code"):
-                            close_slot(run, result["code"], closed, fixture_path, base, token)
+                            attempt_close(result["code"])
                         continue
                     remembered = remember_slot(result)
                     if remembered is not None:
@@ -953,7 +1005,14 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 time.sleep(0.2)
             continue
 
-        if not queue and not any(slot_view(slot)["alive"] for slot in slots):
+        # A failed list is not an empty queue. A close that never got an answer
+        # still occupies a platform slot, so keep ticking until it succeeds.
+        if (
+            not list_failed
+            and not queue
+            and not pending_close
+            and not any(slot_view(slot)["alive"] for slot in slots)
+        ):
             break
         time.sleep(interval)
 
@@ -978,6 +1037,7 @@ def main(argv: list[str] | None = None) -> int:
         workdir = Path(os.environ.get("CONTEST_WORKDIR", str(ROOT / "contest-work"))).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         fixture_path = os.environ.get("CONTEST_FIXTURE", "").strip()
+        http_timeout(30)
         if not supervisor_enabled():
             log("supervisor off")
             return run_once(workdir, token, base, fixture_path)

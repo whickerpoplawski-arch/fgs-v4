@@ -5,7 +5,9 @@ Decisions are pure. IO helpers are thin so tests can run without a platform.
 
 from __future__ import annotations
 
+import http.client
 import json
+import math
 import os
 import signal
 import subprocess
@@ -23,6 +25,14 @@ WORKER_DIR_RE_PREFIX = "w"
 
 class SupervisorError(RuntimeError):
     pass
+
+
+class PlatformTransportError(SupervisorError):
+    """Timeout or dropped connection while calling the Challenges API.
+
+    The platform did not return a finished HTTP status. Callers retry later.
+    A transport failure must not be recorded as a successful close.
+    """
 
 
 def parse_utc_prefix(stamp: str | None) -> datetime | None:
@@ -646,12 +656,45 @@ def api_prefixes() -> list[str]:
     return ["/api/v1", "/openapi/v1"]
 
 
-def request_json(method: str, url: str, token: str, body: dict | None = None, timeout: float = 20):
+def http_timeout(default: float) -> float:
+    """Seconds for one platform HTTP call.
+
+    ``CONTEST_HTTP_TIMEOUT`` overrides ``default`` for list, start, and close.
+    The value has to be finite and positive: ``urlopen(timeout=None)`` would
+    block the supervisor tick until the platform answered.
+    """
+    raw = os.environ.get("CONTEST_HTTP_TIMEOUT", "").strip()
+    if not raw:
+        return float(default)
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise SupervisorError(f"CONTEST_HTTP_TIMEOUT is not a number: {raw}") from exc
+    if not math.isfinite(value) or value <= 0:
+        raise SupervisorError(
+            f"CONTEST_HTTP_TIMEOUT must be a positive number of seconds: {raw}"
+        )
+    return value
+
+
+def _transport_detail(exc: BaseException) -> str:
+    return f"{type(exc).__name__}: {exc}"
+
+
+def request_json(method: str, url: str, token: str, body: dict | None = None, timeout: float | None = None):
+    """Call the Challenges API and parse a JSON body.
+
+    Connect/send failures arrive as ``URLError``. A stall in ``getresponse``
+    or ``resp.read`` arrives as a bare ``TimeoutError``, which is not a
+    ``URLError``. Both are transport failures. HTTP status errors stay
+    ``SupervisorError`` because the platform did answer.
+    """
+    limit = http_timeout(20.0 if timeout is None else float(timeout))
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
     attach_platform_headers(req, token, json_body=body is not None)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with urllib.request.urlopen(req, timeout=limit) as resp:
             raw = resp.read().decode("utf-8")
             payload = json.loads(raw) if raw.strip() else {}
             return resp.status, payload
@@ -659,7 +702,16 @@ def request_json(method: str, url: str, token: str, body: dict | None = None, ti
         detail = exc.read().decode("utf-8", errors="replace")[:300]
         raise SupervisorError(f"HTTP {exc.code} {method} {url} {detail}") from exc
     except urllib.error.URLError as exc:
-        raise SupervisorError(f"request failed {method} {url}: {exc.reason}") from exc
+        reason = exc.reason
+        if isinstance(reason, BaseException):
+            detail = _transport_detail(reason)
+        else:
+            detail = str(reason)
+        raise PlatformTransportError(f"request failed {method} {url}: {detail}") from exc
+    except (TimeoutError, OSError, http.client.HTTPException) as exc:
+        raise PlatformTransportError(f"request failed {method} {url}: {_transport_detail(exc)}") from exc
+    except (json.JSONDecodeError, UnicodeError) as exc:
+        raise SupervisorError(f"request failed {method} {url}: {_transport_detail(exc)}") from exc
 
 
 def coerce_challenges(payload) -> list:
@@ -701,17 +753,28 @@ def load_challenges(fixture: str | None, base: str, token: str) -> tuple[list, b
 def close_challenge(base: str, token: str, code: str, prefixes: list[str] | None = None):
     encoded = urllib.parse.urlencode({"unique_code": code})
     errors = []
+    transport = False
     for prefix in prefixes or api_prefixes():
         url = challenge_url(base, prefix + "/challenges/close?" + encoded)
         try:
             return request_json("POST", url, token, {})
+        except PlatformTransportError as exc:
+            transport = True
+            errors.append(str(exc))
         except SupervisorError as exc:
             errors.append(str(exc))
-    raise SupervisorError("close_challenge failed: " + " | ".join(errors))
+    message = "close_challenge failed: " + " | ".join(errors)
+    if transport:
+        raise PlatformTransportError(message)
+    raise SupervisorError(message)
 
 
 def perform_close(run: Path, code: str, *, base: str, token: str, fixture: str | None, already: set[str]) -> str | None:
-    """Close once. Returns the note, or None if this code was already closed."""
+    """Close once. Returns the note, or None if this code was already closed.
+
+    A transport or HTTP failure is raised and is not recorded. The caller
+    retries on a later tick. Recording the code here would leak the slot.
+    """
     if code in already:
         return None
     if fixture:

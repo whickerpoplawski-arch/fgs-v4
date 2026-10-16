@@ -40,6 +40,7 @@ function baseEnv(extra = {}) {
     'CONTEST_SUPERVISOR_NOW',
     'CONTEST_SUPERVISOR_ONCE',
     'CONTEST_SUPERVISOR_INTERVAL',
+    'CONTEST_HTTP_TIMEOUT',
     'CONTEST_RETIRE_GRACE',
     'CONTEST_RETIRE_GRACE_SOLVED',
     'CONTEST_MAX_ACTIVE',
@@ -808,4 +809,374 @@ print(json.dumps({"parent": os.environ.get("FGS_UNIQUE_CODE"), "pid": result["pi
   assert.equal(out.child.code, 'e2-04');
   assert.equal(out.child.bench, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
   assert.equal(out.child.token, 'secret-token');
+});
+
+test('CONTEST_HTTP_TIMEOUT 覆盖 list/start/close，非法值直接失败', () => {
+  const probed = py(`
+import os
+from supervisor.core import SupervisorError, http_timeout
+os.environ["CONTEST_HTTP_TIMEOUT"] = "8.5"
+print("override", http_timeout(20), http_timeout(30))
+os.environ["CONTEST_HTTP_TIMEOUT"] = "0"
+try:
+    http_timeout(20)
+    print("zero-ok")
+except SupervisorError as exc:
+    print("zero", exc)
+os.environ["CONTEST_HTTP_TIMEOUT"] = "nope"
+try:
+    http_timeout(20)
+    print("bad-ok")
+except SupervisorError as exc:
+    print("bad", exc)
+os.environ.pop("CONTEST_HTTP_TIMEOUT", None)
+print("default", http_timeout(20), http_timeout(30))
+`);
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.match(probed.stdout, /override 8\.5 8\.5/);
+  assert.match(probed.stdout, /zero CONTEST_HTTP_TIMEOUT must be a positive/);
+  assert.match(probed.stdout, /bad CONTEST_HTTP_TIMEOUT is not a number: nope/);
+  assert.match(probed.stdout, /default 20\.0 30\.0/);
+  assert.doesNotMatch(probed.stdout, /zero-ok|bad-ok/);
+});
+
+test('urlopen 的 TimeoutError 变成可重试的传输错误，HTTP 状态不算传输失败', () => {
+  const probed = py(`
+import io, json
+from email.message import Message
+import urllib.error
+import urllib.request
+from supervisor.core import PlatformTransportError, SupervisorError, request_json
+
+class Resp:
+    def __init__(self, body):
+        self.status = 200
+        self._body = body.encode()
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+seen = {"timeouts": []}
+
+def fake_urlopen(req, timeout=None):
+    seen["timeouts"].append(timeout)
+    url = req.full_url
+    if url.endswith("/timeout"):
+        raise TimeoutError("timed out")
+    if url.endswith("/status"):
+        raise urllib.error.HTTPError(url, 404, "missing", Message(), io.BytesIO(b"missing"))
+    return Resp("{}")
+
+urllib.request.urlopen = fake_urlopen
+os_timeout = ""
+try:
+    request_json("POST", "http://benchmark.invalid/api/v1/challenges/close?unique_code=a-16/timeout", "tok", {})
+except PlatformTransportError as exc:
+    os_timeout = str(exc)
+except SupervisorError as exc:
+    os_timeout = "supervisor " + str(exc)
+http_status = ""
+status_type = ""
+try:
+    request_json("POST", "http://benchmark.invalid/api/v1/challenges/close?unique_code=a-16/status", "tok", {})
+except PlatformTransportError as exc:
+    http_status = "transport " + str(exc)
+    status_type = "transport"
+except SupervisorError as exc:
+    http_status = str(exc)
+    status_type = "http"
+print(json.dumps({
+    "timeout": os_timeout,
+    "statusType": status_type,
+    "status": http_status,
+    "timeouts": seen["timeouts"],
+}))
+`);
+  assert.equal(probed.status, 0, probed.stderr);
+  const body = JSON.parse(probed.stdout);
+  assert.match(body.timeout, /TimeoutError: timed out/);
+  assert.equal(body.statusType, 'http');
+  assert.match(body.status, /HTTP 404/);
+  assert.doesNotMatch(body.status, /^transport /);
+  assert.deepEqual(body.timeouts, [20, 20]);
+});
+
+test('真实 urlopen 读超时是 TimeoutError，request_json 收成传输错误', () => {
+  const probed = py(`
+import os, socket, threading, time
+os.environ["CONTEST_HTTP_TIMEOUT"] = "0.3"
+from supervisor.core import PlatformTransportError, SupervisorError, request_json
+sock = socket.socket()
+sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+sock.bind(("127.0.0.1", 0))
+sock.listen(1)
+port = sock.getsockname()[1]
+
+def hold():
+    conn, _ = sock.accept()
+    time.sleep(2)
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+threading.Thread(target=hold, daemon=True).start()
+started = time.time()
+try:
+    request_json(
+        "POST",
+        "http://127.0.0.1:%s/api/v1/challenges/close?unique_code=a-16" % port,
+        "tok",
+        {},
+    )
+    print("NO-ERROR")
+except PlatformTransportError as exc:
+    print("TRANSPORT %.2f %s" % (time.time() - started, exc))
+except SupervisorError as exc:
+    print("SUPERVISOR %.2f %s" % (time.time() - started, exc))
+finally:
+    sock.close()
+`);
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.match(probed.stdout, /TRANSPORT \d+(\.\d+)? request failed POST http:\/\/127\.0\.0\.1:\d+\/api\/v1\/challenges\/close\?unique_code=a-16: TimeoutError: timed out/);
+  assert.doesNotMatch(probed.stdout, /NO-ERROR|SUPERVISOR|Traceback/);
+});
+
+test('close TimeoutError 不退出 driver，下一 tick 重试并关掉', () => {
+  const scratch = tmpDir('fgs-close-to-');
+  const runDir = path.join(scratch, 'run');
+  const probed = py(`
+import json, os, urllib.request
+from pathlib import Path
+import driver
+
+class Resp:
+    def __init__(self, body):
+        self.status = 200
+        self._body = body.encode()
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+challenges = {"challenges": [
+    {"unique_code": "a-16", "is_completed": False, "container_status": "available", "description": "ssrf"},
+    {"unique_code": "a-17", "is_completed": False, "container_status": "available", "description": "diag"},
+    {"unique_code": "a-18", "is_completed": False, "container_status": "available", "description": "jwt"},
+]}
+state = {"closes": 0, "timeouts": []}
+
+def fake_urlopen(req, timeout=None):
+    state["timeouts"].append(timeout)
+    url = req.full_url
+    if "/challenges/close" in url:
+        state["closes"] += 1
+        if state["closes"] == 1:
+            raise TimeoutError("timed out")
+        return Resp("{}")
+    if req.get_method() == "GET":
+        return Resp(json.dumps(challenges))
+    raise AssertionError(url)
+
+urllib.request.urlopen = fake_urlopen
+sleeps = {"n": 0}
+probe = Path(os.environ["RUN"]) / "probe.json"
+
+def fake_sleep(_seconds):
+    sleeps["n"] += 1
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text(json.dumps({"sleeps": sleeps["n"], "closes": state["closes"], "timeouts": state["timeouts"]}), encoding="utf-8")
+    if sleeps["n"] >= 2:
+        raise SystemExit(0)
+
+driver.time.sleep = fake_sleep
+run = Path(os.environ["RUN"])
+work = Path(os.environ["CONTEST_WORKDIR"])
+driver.supervisor_loop(run, work, os.environ["BENCHMARK_TOKEN"], os.environ["BENCHMARK_BASE_URL"], "")
+`, {
+    RUN: runDir,
+    CONTEST_WORKDIR: path.join(scratch, 'work'),
+    CONTEST_HTTP_TIMEOUT: '8',
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    BENCHMARK_API_PREFIX: '/api/v1',
+    PYTHONUNBUFFERED: '1',
+  });
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.doesNotMatch(probed.stderr, /Traceback/);
+  assert.match(probed.stderr, /close a-16 failed:.*TimeoutError: timed out/);
+  assert.match(probed.stderr, /pending retry/);
+  assert.match(probed.stderr, /close a-16 failed:[\s\S]*contest: close a-16\n/);
+  const ticks = probed.stderr.split('supervisor tick').length - 1;
+  assert.ok(ticks >= 2, probed.stderr);
+  const probe = JSON.parse(fs.readFileSync(path.join(runDir, 'probe.json'), 'utf8'));
+  assert.equal(probe.sleeps, 2);
+  assert.ok(probe.closes >= 2);
+  assert.ok(probe.timeouts.length >= 2);
+  assert.ok(probe.timeouts.every((value) => value === 8));
+  const closed = fs.readFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'utf8');
+  assert.match(closed, /^a-16$/m);
+  assert.match(closed, /^a-17$/m);
+  assert.match(closed, /^a-18$/m);
+});
+
+test('list TimeoutError 不退出 driver，按未知列表失败关闭并继续 tick', () => {
+  const scratch = tmpDir('fgs-list-to-');
+  const runDir = path.join(scratch, 'run');
+  const probed = py(`
+import json, os, urllib.request
+from pathlib import Path
+import driver
+
+def fake_urlopen(req, timeout=None):
+    raise TimeoutError("timed out")
+
+urllib.request.urlopen = fake_urlopen
+sleeps = {"n": 0}
+probe = Path(os.environ["RUN"]) / "probe.json"
+
+def fake_sleep(_seconds):
+    sleeps["n"] += 1
+    probe.parent.mkdir(parents=True, exist_ok=True)
+    probe.write_text(json.dumps({"sleeps": sleeps["n"]}), encoding="utf-8")
+    if sleeps["n"] >= 2:
+        raise SystemExit(0)
+
+driver.time.sleep = fake_sleep
+run = Path(os.environ["RUN"])
+work = Path(os.environ["CONTEST_WORKDIR"])
+driver.supervisor_loop(run, work, os.environ["BENCHMARK_TOKEN"], os.environ["BENCHMARK_BASE_URL"], "")
+`, {
+    RUN: runDir,
+    CONTEST_WORKDIR: path.join(scratch, 'work'),
+    CONTEST_HTTP_TIMEOUT: '8',
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    BENCHMARK_API_PREFIX: '/api/v1',
+    PYTHONUNBUFFERED: '1',
+  });
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.doesNotMatch(probed.stderr, /Traceback/);
+  assert.doesNotMatch(probed.stderr, /no pending challenges/);
+  assert.match(probed.stderr, /list challenges failed:.*TimeoutError: timed out/);
+  const ticks = probed.stderr.split('supervisor tick').length - 1;
+  assert.ok(ticks >= 2, probed.stderr);
+  assert.match(probed.stderr, /active=99/);
+  const probe = JSON.parse(fs.readFileSync(path.join(runDir, 'probe.json'), 'utf8'));
+  assert.equal(probe.sleeps, 2);
+});
+
+test('start TimeoutError 记成 visit 失败，driver 跑完主循环', () => {
+  const scratch = tmpDir('fgs-start-to-');
+  const probed = py(`
+import json, os, urllib.request
+from pathlib import Path
+import driver
+
+class Resp:
+    def __init__(self, body):
+        self.status = 200
+        self._body = body.encode()
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+body = json.dumps({"challenges": [{
+    "unique_code": "a-18",
+    "is_completed": False,
+    "container_status": "stopped",
+    "description": "jwt",
+}]})
+
+def fake_urlopen(req, timeout=None):
+    url = req.full_url
+    if "/challenges/start" in url:
+        raise TimeoutError("timed out")
+    if req.get_method() == "GET":
+        return Resp(body)
+    raise AssertionError(url)
+
+urllib.request.urlopen = fake_urlopen
+run = Path(os.environ["RUN"])
+work = Path(os.environ["CONTEST_WORKDIR"])
+raise SystemExit(driver.supervisor_loop(
+    run, work, os.environ["BENCHMARK_TOKEN"], os.environ["BENCHMARK_BASE_URL"], "",
+))
+`, {
+    RUN: path.join(scratch, 'run'),
+    CONTEST_WORKDIR: path.join(scratch, 'work'),
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    BENCHMARK_API_PREFIX: '/api/v1',
+    PYTHONUNBUFFERED: '1',
+  });
+  assert.equal(probed.status, 1, probed.stderr);
+  assert.doesNotMatch(probed.stderr, /Traceback/);
+  assert.match(probed.stderr, /visit a-18 failed:.*TimeoutError: timed out/);
+  assert.match(probed.stderr, /done ok=0 failed=1/);
+});
+
+test('supervisor tick：close TimeoutError 后下一 tick 仍能关掉', () => {
+  const scratch = tmpDir('fgs-cli-close-to-');
+  const runDir = path.join(scratch, 'run');
+  const probed = py(`
+import json, os, sys, urllib.request
+sys.path.insert(0, os.path.join(os.environ["PYTHONPATH"], "supervisor"))
+import cli
+
+class Resp:
+    def __init__(self, body):
+        self.status = 200
+        self._body = body.encode()
+    def read(self):
+        return self._body
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        return False
+
+challenges = {"challenges": [
+    {"unique_code": "a-16", "is_completed": False, "container_status": "available"},
+    {"unique_code": "a-17", "is_completed": False, "container_status": "available"},
+    {"unique_code": "a-18", "is_completed": False, "container_status": "available"},
+]}
+state = {"closes": 0}
+
+def fake_urlopen(req, timeout=None):
+    url = req.full_url
+    if "/challenges/close" in url:
+        state["closes"] += 1
+        if state["closes"] == 1:
+            raise TimeoutError("timed out")
+        return Resp("{}")
+    if req.get_method() == "GET":
+        return Resp(json.dumps(challenges))
+    raise AssertionError(url)
+
+urllib.request.urlopen = fake_urlopen
+first = cli.cmd_tick([])
+second = cli.cmd_tick([])
+print(json.dumps({"first": first, "second": second, "closes": state["closes"]}))
+`, {
+    RUN: runDir,
+    CONTEST_HTTP_TIMEOUT: '8',
+    BENCHMARK_API_PREFIX: '/api/v1',
+    PYTHONUNBUFFERED: '1',
+  });
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.doesNotMatch(probed.stderr, /Traceback/);
+  assert.match(probed.stderr, /contest: close a-16 failed:.*TimeoutError: timed out/);
+  assert.match(probed.stderr, /pending retry/);
+  assert.match(probed.stdout, /close a-16 ->/);
+  const body = JSON.parse(probed.stdout.trim().split('\n').filter((line) => line.startsWith('{')).at(-1));
+  assert.equal(body.first, 0);
+  assert.equal(body.second, 0);
+  assert.ok(body.closes >= 2);
+  const closed = fs.readFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'utf8');
+  assert.match(closed, /^a-16$/m);
 });
