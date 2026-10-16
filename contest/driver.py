@@ -20,10 +20,10 @@ the default leaves VPN off and does not block pre-seed.
 SOLVER_GATEWAY=1 rewrites model base URLs only: env vars such as
 DEEPSEEK_BASE_URL / OPENAI_BASE_URL, and a contest profile's baseURL field,
 become `http://<host>.tsecbench.gw/...` (https becomes http). It must not
-rewrite BENCHMARK_BASE_URL, BENCHMARK_TOKEN, or Challenges API URLs. The
-gateway allowlist is LLM APIs; the platform host is not on it. Contest
-profiles must use openai-completions; the responses streaming path drops
-function_call.
+rewrite BENCHMARK_BASE_URL, BENCHMARK_TOKEN, or Challenges API URLs.
+BENCHMARK_BASE_URL is opaque platform injection and is used as given, even
+when the platform already supplies a `.tsecbench.gw` host. Contest profiles
+must use openai-completions; the responses streaming path drops function_call.
 
 Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
   { "challenges": [ { "unique_code", "description", "is_completed", "container_addr": [] } ] }
@@ -61,6 +61,7 @@ from supervisor.core import (
     count_active,
     dispatch_budget,
     grace_settings,
+    injected_platform_hosts,
     list_samplers,
     load_closed_set,
     mark_retired,
@@ -78,7 +79,7 @@ ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = ROOT / "tools" / "bootstrap_project.mjs"
 DEFAULT_CRITERION = "取得有效 flag 并 submit correct=true"
 # Explicit allowlist. Do not scan os.environ for http(s) values: BENCHMARK_BASE_URL
-# is also an https URL, and the solver gateway rejects the Challenges API host.
+# is opaque platform injection and may already be a *.tsecbench.gw host.
 MODEL_URL_ENVS = (
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
@@ -112,16 +113,8 @@ def normalize_problem_id(raw: str) -> str:
 
 
 def protected_platform_hosts() -> set[str]:
-    """Hosts of the injected Challenges API. The gateway must not see these."""
-    hosts: set[str] = set()
-    for name in ("BENCHMARK_BASE_URL", "PLATFORM_BASE_URL"):
-        raw = os.environ.get(name, "").strip()
-        if not raw:
-            continue
-        host = urllib.parse.urlsplit(raw).hostname
-        if host:
-            hosts.add(host.lower())
-    return hosts
+    """Hosts of the injected Challenges API. Model rewrite must leave them unchanged."""
+    return injected_platform_hosts()
 
 
 def is_protected_platform_url(url: str) -> bool:
@@ -147,7 +140,8 @@ def rewrite_model_base(url: str) -> str:
 
     https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1
     Hosts that already end in `.tsecbench.gw` are not double-suffixed.
-    BENCHMARK_BASE_URL and Challenges API URLs are returned unchanged.
+    BENCHMARK_BASE_URL is never rewritten, even when it already ends in
+    ``.tsecbench.gw``. Challenges API URLs are returned unchanged.
     """
     raw = str(url or "").strip()
     if not raw or os.environ.get("SOLVER_GATEWAY") != "1":
@@ -290,7 +284,11 @@ def rewrite_profile_bases() -> None:
 
 
 def apply_gateway_rewrites() -> None:
-    """Rewrite model endpoints onto *.tsecbench.gw. Leave the Challenges API alone."""
+    """Rewrite model endpoints onto *.tsecbench.gw.
+
+    BENCHMARK_* is restored verbatim. A platform-injected Challenges host that
+    already ends in ``.tsecbench.gw`` stays that way and is still called.
+    """
     if os.environ.get("SOLVER_GATEWAY") != "1":
         log("SOLVER_GATEWAY is off; model base URLs are unchanged")
         return

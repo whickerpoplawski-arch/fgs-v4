@@ -165,6 +165,54 @@ test('SOLVER_GATEWAY=1 不改写 BENCHMARK_BASE_URL，DEEPSEEK_BASE_URL 走 *.ts
   assert.doesNotMatch(cases.benchmark + cases.listUrl + cases.direct + cases.directPath, /tsecbench\.gw/);
 });
 
+test('平台已注入 *.tsecbench.gw 的 BENCHMARK_BASE_URL 时允许 list，DEEPSEEK 仍改写', () => {
+  const script = [
+    'import json, os, tempfile',
+    'from pathlib import Path',
+    'import driver',
+    'from supervisor import core',
+    'profile = Path(tempfile.mkdtemp())',
+    'os.environ["CONTEST_DSH_PROFILE_DIR"] = str(profile)',
+    'os.environ.pop("DSH_HOME", None)',
+    'os.environ.pop("PLATFORM_BASE_URL", None)',
+    'os.environ["SOLVER_GATEWAY"] = "1"',
+    'injected = "http://tsecbench.zc.tencent.com.tsecbench.gw"',
+    'os.environ["BENCHMARK_BASE_URL"] = injected',
+    'os.environ["BENCHMARK_TOKEN"] = "secret-token"',
+    'os.environ["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com/v1"',
+    'driver.apply_gateway_rewrites()',
+    'base = os.environ["BENCHMARK_BASE_URL"]',
+    'refused = ""',
+    'try:',
+    '    core.challenge_url("http://api.deepseek.com.tsecbench.gw", "/api/v1/challenges")',
+    'except core.SupervisorError as exc:',
+    '    refused = str(exc)',
+    'print(json.dumps({',
+    '    "benchmark": base,',
+    '    "token": os.environ["BENCHMARK_TOKEN"],',
+    '    "deepseek": os.environ["DEEPSEEK_BASE_URL"],',
+    '    "listUrl": core.challenge_url(base, "/api/v1/challenges"),',
+    '    "direct": driver.rewrite_model_base(injected),',
+    '    "httpsDirect": driver.rewrite_model_base("https://tsecbench.zc.tencent.com.tsecbench.gw"),',
+    '    "refused": refused,',
+    '}))',
+  ].join('\n');
+  const result = runPython(['-c', script], { PYTHONPATH: path.join(repoRoot, 'contest') });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const cases = JSON.parse(result.stdout);
+  assert.equal(cases.benchmark, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
+  assert.equal(cases.token, 'secret-token');
+  assert.equal(cases.listUrl, 'http://tsecbench.zc.tencent.com.tsecbench.gw/api/v1/challenges');
+  assert.equal(cases.direct, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
+  assert.equal(cases.httpsDirect, 'https://tsecbench.zc.tencent.com.tsecbench.gw');
+  assert.equal(cases.deepseek, 'http://api.deepseek.com.tsecbench.gw/v1');
+  assert.match(cases.refused, /BENCHMARK_BASE_URL/);
+  assert.match(result.stderr, /rewrote DEEPSEEK_BASE_URL: https:\/\/api\.deepseek\.com\/v1 → http:\/\/api\.deepseek\.com\.tsecbench\.gw\/v1/);
+  assert.match(result.stderr, /BENCHMARK_BASE_URL unchanged: http:\/\/tsecbench\.zc\.tencent\.com\.tsecbench\.gw/);
+  assert.doesNotMatch(result.stderr, /rewrote BENCHMARK/);
+  assert.doesNotMatch(result.stderr, /refusing Challenges API URL/);
+});
+
 test('submit_flag 在提交请求上带 BENCHMARK_TOKEN', async () => {
   // submit_flag 走 fetch。同进程 HTTP stub 会被 spawnSync 卡住，所以 stub 单独起进程。
   const scratch = tmpDir('fgs-submit-hdr-');
