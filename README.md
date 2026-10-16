@@ -32,9 +32,7 @@ dsh plugin --profile web add github:<你的用户名>/<仓库名>
 
 设置 → 插件 → 安装 → 填上面的路径或 git 形式（同一个安装器）。
 
-托管竞赛不要等模型敲 `/fgs new` 或调用 `fgs_project`。镜像启动后由
-`contest/entrypoint.sh` 在任何模型回合之前把题种到磁盘，见
-[TSecBench contest entry](#tsecbench-contest-entry)。
+只把插件装进 profile `bundles` 只有 FGS 工具和黑板，不会跑 reap / retire。托管容器的额外要求见「[托管容器额外要求](#hosted-container-extras)」。
 
 装完**即生效（DSH 对 profile 热加载，无需重启）**。安装器会做两件事：把包写进 profile 的
 `dependencies`，并**自动把它加入 `dsh.profile.bundles`**（这一步是关键——只加 `dependencies`
@@ -69,6 +67,27 @@ grep -n 'fgs-deepseek-dsh' ~/.dsh/profiles/web/package.json
 > dsh plugin --profile web add /绝对路径/<插件目录>   # 重新触发挂载
 > curl -s "http://127.0.0.1:3080/fgs/state?token=<TOKEN>"   # 必须重新出现 pluginGeneration
 > ```
+
+<a id="hosted-container-extras"></a>
+
+## 「托管容器额外要求」
+
+只把本插件装进自己的 DeepSeek harness（`dsh plugin add`，包进入 profile 的 `dependencies` 和 `dsh.profile.bundles`）只提供 **FGS 工具和黑板**。没有 contest driver，reap / retire 不会跑。
+
+Installing this plugin into a profile bundle only provides the **FGS tools and the blackboard**. That install does not start the contest driver.
+
+TSecBench 托管容器在插件之外还要：
+
+- **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` → 磁盘预种 → `dsh`。预种在任何模型回合之前完成，不要等模型敲 `/fgs new` 或调用 `fgs_project`。
+- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`。
+- **不要设置** `BENCHMARK_*`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入；不要写进镜像，也不要填在上传页。
+- 竞赛 profile 用 **openai-completions**（responses 流式会丢 `function_call`）。模型 base URL 用网关白名单上的 LLM 基址，例如 `https://api.deepseek.com/v1`。`SOLVER_GATEWAY=1` 只改写 `DEEPSEEK_BASE_URL` / `OPENAI_BASE_URL` 等和 profile 的 `baseURL`（`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`），不改 `BENCHMARK_*` 和 Challenges API。
+
+没有 contest driver，或 `CONTEST_SUPERVISOR` 不是 `1`，**reap / retire 不会运行**。
+
+The hosted container also needs `ENTRYPOINT contest/entrypoint.sh` (driver: list → start → disk preseed → dsh), plus `CONTEST_SUPERVISOR=1`, `CONTEST_DSH_LAUNCH=1`, and `SOLVER_GATEWAY=1`. Do not set `BENCHMARK_*` (the platform injects them). Use openai-completions and an allowlisted model base URL such as `https://api.deepseek.com/v1`. Without the contest driver and `CONTEST_SUPERVISOR=1`, reap / retire do not run.
+
+细则：[`contest/SUPERVISOR.md`](contest/SUPERVISOR.md)，启动顺序见 [TSecBench contest entry](#tsecbench-contest-entry)。
 
 ## 用
 

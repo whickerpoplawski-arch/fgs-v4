@@ -2,6 +2,10 @@
 
 插件 D-002 已经在 deferred 之后拒绝 Execute（`docs/DEFERRED_STOP.md`）。进程和容器槽位不归插件管。本目录补的是这一层。
 
+只把插件装进 profile `bundles` 不会启动这里的 reap / retire。那一层只在托管容器走 `contest/entrypoint.sh` → `contest/driver.py` 且 `CONTEST_SUPERVISOR=1` 时运行。对照 README「[托管容器额外要求](../README.md#hosted-container-extras)」。
+
+A profile-bundle install does not run reap / retire. See README 「托管容器额外要求」.
+
 ## 谁在调度
 
 托管入口只有一个调度器：`contest/driver.py`。
