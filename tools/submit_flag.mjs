@@ -87,6 +87,7 @@ async function submit(base, token, uniqueCode, flag) {
         'content-type': 'application/json',
         authorization: `Bearer ${token}`,
         'x-benchmark-token': token,
+        BENCHMARK_TOKEN: token,
       },
       body: JSON.stringify({ unique_code: uniqueCode, flag }),
       signal: AbortSignal.timeout(20_000),

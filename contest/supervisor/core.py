@@ -559,6 +559,38 @@ def dispatch_worker(run: Path, code: str, brief: str, command: list[str] | None)
     return {"code": code, "dir": str(dest), "pid": pid}
 
 
+def attach_platform_headers(req, token: str, *, json_body: bool = False) -> None:
+    """Headers for list / start / submit / close.
+
+    The platform requires the literal header ``BENCHMARK_TOKEN`` (FastAPI 422
+    if it is missing). Assign it directly: ``Request.add_header`` runs
+    ``str.capitalize()`` and would send ``Benchmark_token``.
+    """
+    req.headers["authorization"] = f"Bearer {token}"
+    req.headers["x-benchmark-token"] = token
+    req.headers["BENCHMARK_TOKEN"] = token
+    req.headers["accept"] = "application/json"
+    if json_body:
+        req.headers["content-type"] = "application/json"
+
+
+def challenge_url(base: str, path: str) -> str:
+    """Join the injected platform base with a Challenges path.
+
+    ``*.tsecbench.gw`` is the model gateway. A Challenges request there is
+    rejected with "request URL is not allowed by tsecbench".
+    """
+    raw = str(base or "").strip().rstrip("/")
+    suffix = path if str(path).startswith("/") else f"/{path}"
+    url = raw + suffix
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host.endswith(".tsecbench.gw"):
+        raise SupervisorError(
+            f"refusing Challenges API URL {url}: SOLVER_GATEWAY must not rewrite BENCHMARK_BASE_URL"
+        )
+    return url
+
+
 def api_prefixes() -> list[str]:
     explicit = os.environ.get("BENCHMARK_API_PREFIX", "").strip()
     if explicit:
@@ -571,12 +603,7 @@ def api_prefixes() -> list[str]:
 def request_json(method: str, url: str, token: str, body: dict | None = None, timeout: float = 20):
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("authorization", f"Bearer {token}")
-    req.add_header("x-benchmark-token", token)
-    req.add_header("BENCHMARK_TOKEN", token)
-    req.add_header("accept", "application/json")
-    if body is not None:
-        req.add_header("content-type", "application/json")
+    attach_platform_headers(req, token, json_body=body is not None)
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = resp.read().decode("utf-8")
@@ -610,7 +637,7 @@ def load_challenges(fixture: str | None, base: str, token: str) -> tuple[list, b
         return coerce_challenges(payload), False
     errors = []
     for prefix in api_prefixes():
-        url = base.rstrip("/") + prefix + "/challenges"
+        url = challenge_url(base, prefix + "/challenges")
         try:
             _status, payload = request_json("GET", url, token)
         except SupervisorError as exc:
@@ -629,7 +656,7 @@ def close_challenge(base: str, token: str, code: str, prefixes: list[str] | None
     encoded = urllib.parse.urlencode({"unique_code": code})
     errors = []
     for prefix in prefixes or api_prefixes():
-        url = base.rstrip("/") + prefix + "/challenges/close?" + encoded
+        url = challenge_url(base, prefix + "/challenges/close?" + encoded)
         try:
             return request_json("POST", url, token, {})
         except SupervisorError as exc:

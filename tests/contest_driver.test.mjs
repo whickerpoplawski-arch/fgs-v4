@@ -5,7 +5,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { GraphStore } from '../controller/index.js';
@@ -50,6 +50,181 @@ test('SOLVER_GATEWAY=1 把模型基址改写成 *.tsecbench.gw 且 https→http'
   assert.equal(cases.already, 'http://api.deepseek.com.tsecbench.gw/v1');
   assert.equal(cases.port, 'http://api.deepseek.com.tsecbench.gw:8443/v1?x=1');
   assert.equal(cases.off, 'https://api.deepseek.com/v1');
+});
+
+test('SOLVER_GATEWAY=1 不改写 BENCHMARK_BASE_URL，DEEPSEEK_BASE_URL 走 *.tsecbench.gw', () => {
+  const script = [
+    'import json, os, tempfile, threading, urllib.request',
+    'from http.server import BaseHTTPRequestHandler, HTTPServer',
+    'from pathlib import Path',
+    'import driver',
+    'from supervisor import core',
+    'profile = Path(tempfile.mkdtemp())',
+    '(profile / "cordis.patch.yml").write_text(',
+    '    "baseURL: https://api.deepseek.com/v1\\n"',
+    '    "benchmark: https://tsecbench.zc.tencent.com\\n"',
+    '    "note: keep https://tsecbench.zc.tencent.com/api/v1/challenges\\n",',
+    '    encoding="utf-8",',
+    ')',
+    '(profile / "settings.json").write_text(json.dumps({',
+    '    "baseURL": "https://api.openai.com/v1",',
+    '    "platform": {"baseURL": "https://tsecbench.zc.tencent.com"},',
+    '    "extra": "https://tsecbench.zc.tencent.com/openapi/v1/challenges",',
+    '}), encoding="utf-8")',
+    'os.environ["CONTEST_DSH_PROFILE_DIR"] = str(profile)',
+    'os.environ["SOLVER_GATEWAY"] = "1"',
+    'os.environ["BENCHMARK_BASE_URL"] = "https://tsecbench.zc.tencent.com"',
+    'os.environ["PLATFORM_BASE_URL"] = "https://tsecbench.zc.tencent.com"',
+    'os.environ["BENCHMARK_TOKEN"] = "secret-token"',
+    'os.environ["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com/v1"',
+    'os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"',
+    'seen = {"hits": []}',
+    'class Handler(BaseHTTPRequestHandler):',
+    '    def _finish(self):',
+    '        length = int(self.headers.get("content-length") or 0)',
+    '        if length:',
+    '            self.rfile.read(length)',
+    '        seen["hits"].append({',
+    '            "method": self.command,',
+    '            "path": self.path.split("?")[0],',
+    '            "token": self.headers.get("BENCHMARK_TOKEN"),',
+    '        })',
+    '        body = b\'[{"unique_code":"a-1","is_completed":true}]\'',
+    '        if self.path.split("?")[0].endswith("/close"):',
+    '            body = b\'{"closed":true}\'',
+    '        self.send_response(200)',
+    '        self.send_header("content-type", "application/json")',
+    '        self.end_headers()',
+    '        self.wfile.write(body)',
+    '    def do_GET(self):',
+    '        self._finish()',
+    '    def do_POST(self):',
+    '        self._finish()',
+    '    def log_message(self, fmt, *args):',
+    '        return',
+    'server = HTTPServer(("127.0.0.1", 0), Handler)',
+    'thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)',
+    'thread.start()',
+    'driver.apply_gateway_rewrites()',
+    'port = server.server_address[1]',
+    'local = f"http://127.0.0.1:{port}"',
+    'driver._request("GET", local + "/openapi/v1/challenges", "secret-token")',
+    'driver._request("POST", local + "/openapi/v1/challenges/start", "secret-token", {"unique_code": "a-1"})',
+    'core.request_json("POST", local + "/openapi/v1/challenges/close?unique_code=a-1", "secret-token", {})',
+    'server.shutdown()',
+    'probe = urllib.request.Request("http://127.0.0.1/openapi/v1/challenges", method="GET")',
+    'core.attach_platform_headers(probe, "secret-token")',
+    'refused = ""',
+    'try:',
+    '    core.challenge_url("http://tsecbench.zc.tencent.com.tsecbench.gw", "/api/v1/challenges")',
+    'except core.SupervisorError as exc:',
+    '    refused = str(exc)',
+    'print(json.dumps({',
+    '    "benchmark": os.environ["BENCHMARK_BASE_URL"],',
+    '    "platform": os.environ["PLATFORM_BASE_URL"],',
+    '    "token": os.environ["BENCHMARK_TOKEN"],',
+    '    "deepseek": os.environ["DEEPSEEK_BASE_URL"],',
+    '    "openai": os.environ["OPENAI_BASE_URL"],',
+    '    "direct": driver.rewrite_model_base("https://tsecbench.zc.tencent.com"),',
+    '    "directPath": driver.rewrite_model_base("https://tsecbench.zc.tencent.com/api/v1/challenges"),',
+    '    "yaml": (profile / "cordis.patch.yml").read_text(encoding="utf-8"),',
+    '    "settings": json.loads((profile / "settings.json").read_text(encoding="utf-8")),',
+    '    "hits": seen["hits"],',
+    '    "headerNames": list(probe.headers),',
+    '    "refused": refused,',
+    '    "listUrl": core.challenge_url("https://tsecbench.zc.tencent.com", "/api/v1/challenges"),',
+    '}))',
+  ].join('\n');
+  const result = runPython(['-c', script], { PYTHONPATH: path.join(repoRoot, 'contest') });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const cases = JSON.parse(result.stdout);
+  assert.equal(cases.benchmark, 'https://tsecbench.zc.tencent.com');
+  assert.equal(cases.platform, 'https://tsecbench.zc.tencent.com');
+  assert.equal(cases.token, 'secret-token');
+  assert.equal(cases.deepseek, 'http://api.deepseek.com.tsecbench.gw/v1');
+  assert.equal(cases.openai, 'http://api.openai.com.tsecbench.gw/v1');
+  assert.equal(cases.direct, 'https://tsecbench.zc.tencent.com');
+  assert.equal(cases.directPath, 'https://tsecbench.zc.tencent.com/api/v1/challenges');
+  assert.equal(cases.listUrl, 'https://tsecbench.zc.tencent.com/api/v1/challenges');
+  assert.match(cases.yaml, /baseURL: http:\/\/api\.deepseek\.com\.tsecbench\.gw\/v1/);
+  assert.match(cases.yaml, /benchmark: https:\/\/tsecbench\.zc\.tencent\.com\n/);
+  assert.match(cases.yaml, /note: keep https:\/\/tsecbench\.zc\.tencent\.com\/api\/v1\/challenges/);
+  assert.equal(cases.settings.baseURL, 'http://api.openai.com.tsecbench.gw/v1');
+  assert.equal(cases.settings.platform.baseURL, 'https://tsecbench.zc.tencent.com');
+  assert.equal(cases.settings.extra, 'https://tsecbench.zc.tencent.com/openapi/v1/challenges');
+  assert.deepEqual(
+    cases.hits.map((hit) => hit.path),
+    ['/openapi/v1/challenges', '/openapi/v1/challenges/start', '/openapi/v1/challenges/close'],
+  );
+  assert.deepEqual(cases.hits.map((hit) => hit.token), ['secret-token', 'secret-token', 'secret-token']);
+  assert.ok(cases.headerNames.includes('BENCHMARK_TOKEN'));
+  assert.match(cases.refused, /BENCHMARK_BASE_URL/);
+  assert.match(result.stderr, /rewrote DEEPSEEK_BASE_URL: https:\/\/api\.deepseek\.com\/v1 → http:\/\/api\.deepseek\.com\.tsecbench\.gw\/v1/);
+  assert.match(result.stderr, /BENCHMARK_BASE_URL unchanged: https:\/\/tsecbench\.zc\.tencent\.com/);
+  assert.doesNotMatch(result.stderr, /rewrote BENCHMARK/);
+  assert.doesNotMatch(cases.benchmark + cases.listUrl + cases.direct + cases.directPath, /tsecbench\.gw/);
+});
+
+test('submit_flag 在提交请求上带 BENCHMARK_TOKEN', async () => {
+  // submit_flag 走 fetch。同进程 HTTP stub 会被 spawnSync 卡住，所以 stub 单独起进程。
+  const scratch = tmpDir('fgs-submit-hdr-');
+  const hitFile = path.join(scratch, 'hits.jsonl');
+  const server = spawn(process.execPath, ['-e', [
+    "const http = require('http');",
+    "const fs = require('fs');",
+    'const server = http.createServer((req, res) => {',
+    '  fs.appendFileSync(process.env.HIT_FILE, JSON.stringify({',
+    '    path: req.url,',
+    '    token: req.headers.benchmark_token,',
+    '    authorization: req.headers.authorization,',
+    "  }) + '\\n');",
+    "  res.writeHead(200, { 'content-type': 'application/json' });",
+    "  res.end('{\"correct\":true}');",
+    '});',
+    "server.listen(0, '127.0.0.1', () => {",
+    "  process.stdout.write('PORT ' + server.address().port + '\\n');",
+    '});',
+  ].join('\n')], {
+    env: { ...process.env, HIT_FILE: hitFile },
+    stdio: ['ignore', 'pipe', 'inherit'],
+  });
+  const port = await new Promise((resolve, reject) => {
+    let buf = '';
+    const timer = setTimeout(() => reject(new Error('submit stub did not listen')), 5000);
+    server.stdout.on('data', (chunk) => {
+      buf += chunk;
+      const match = buf.match(/PORT (\d+)/);
+      if (match) {
+        clearTimeout(timer);
+        resolve(match[1]);
+      }
+    });
+    server.on('error', reject);
+    server.on('exit', (code) => reject(new Error(`submit stub exited ${code}`)));
+  });
+  try {
+    const result = spawnSync(process.execPath, [path.join(repoRoot, 'tools', 'submit_flag.mjs')], {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      input: JSON.stringify({
+        facts: [{ id: 'fact_001', title: 'flag{abcd1234}', content: 'got flag{abcd1234}' }],
+      }),
+      env: {
+        ...process.env,
+        BENCHMARK_BASE_URL: `http://127.0.0.1:${port}`,
+        BENCHMARK_TOKEN: 'secret-token',
+        FGS_UNIQUE_CODE: 'b-02',
+      },
+    });
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+    const hits = fs.readFileSync(hitFile, 'utf8').trim().split('\n').map((line) => JSON.parse(line));
+    assert.equal(hits.length, 1);
+    assert.equal(hits[0].path, '/openapi/v1/challenges/submit');
+    assert.equal(hits[0].token, 'secret-token');
+    assert.equal(hits[0].authorization, 'Bearer secret-token');
+  } finally {
+    server.kill();
+  }
 });
 
 test('fixture 队列预种后图存在，第二次 driver 不改 graph.yaml', () => {

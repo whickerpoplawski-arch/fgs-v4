@@ -9,7 +9,7 @@
 # Put LLM keys in the upload-page env. Upload cap is 3GB (.tar / .tar.gz / .tgz).
 #
 # Hosted has no public internet. Set SOLVER_GATEWAY=1 at runtime so the driver
-# rewrites allowlisted model bases:
+# rewrites model bases only (never BENCHMARK_BASE_URL):
 #   https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1
 #
 # dsh is not vendored in this P0 skeleton. Install the harness in the real
