@@ -574,16 +574,41 @@ def attach_platform_headers(req, token: str, *, json_body: bool = False) -> None
         req.headers["content-type"] = "application/json"
 
 
+def injected_platform_hosts() -> set[str]:
+    """Hosts of the platform-injected Challenges base.
+
+    ``BENCHMARK_BASE_URL`` is opaque. The platform may already hand it over
+    ending in ``.tsecbench.gw``. ``PLATFORM_BASE_URL`` is the same injection
+    under the older name. Model-gateway rewrite must not touch these hosts.
+    """
+    hosts: set[str] = set()
+    for name in ("BENCHMARK_BASE_URL", "PLATFORM_BASE_URL"):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        host = (urllib.parse.urlsplit(raw).hostname or "").lower()
+        if host:
+            hosts.add(host)
+    return hosts
+
+
 def challenge_url(base: str, path: str) -> str:
     """Join the injected platform base with a Challenges path.
 
-    ``*.tsecbench.gw`` is the model gateway. A Challenges request there is
-    rejected with "request URL is not allowed by tsecbench".
+    Allow a URL whose host is exactly the injected ``BENCHMARK_BASE_URL``
+    host, including when that host already ends in ``.tsecbench.gw``. That
+    value is the real Challenges API, not a rewrite this process applied.
+
+    Refuse any other ``.tsecbench.gw`` host. That is a public Challenges host
+    this process suffixed itself, or a model-gateway host. The model gateway
+    rejects those URLs with "request URL is not allowed by tsecbench".
     """
     raw = str(base or "").strip().rstrip("/")
     suffix = path if str(path).startswith("/") else f"/{path}"
     url = raw + suffix
     host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    if host and host in injected_platform_hosts():
+        return url
     if host.endswith(".tsecbench.gw"):
         raise SupervisorError(
             f"refusing Challenges API URL {url}: SOLVER_GATEWAY must not rewrite BENCHMARK_BASE_URL"
