@@ -115,6 +115,72 @@ function py(code, env = {}) {
   });
 }
 
+function writeDeferredSleeper(dir, deferredAt) {
+  const script = path.join(dir, 'worker.sh');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(script, `#!/bin/sh
+id=$(basename "$PWD")
+mkdir -p ".fgs/projects/$id"
+printf '%s\\n' '{"state":"deferred","deferredAt":"${deferredAt}"}' > ".fgs/projects/$id/meta.json"
+exec sleep 120
+`);
+  fs.chmodSync(script, 0o755);
+  return script;
+}
+
+function killPid(pid) {
+  if (!pid) return;
+  try {
+    process.kill(pid, 'SIGKILL');
+  } catch {
+    // already gone
+  }
+}
+
+function runUntilMatch(bin, args, env, pattern, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(bin, args, {
+      cwd: repoRoot,
+      env: { ...env, PYTHONUNBUFFERED: '1' },
+    });
+    let stdout = '';
+    let stderr = '';
+    let matched = false;
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk;
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk;
+      if (!matched && pattern.test(stderr)) {
+        matched = true;
+        clearTimeout(timer);
+        try {
+          child.kill('SIGKILL');
+        } catch {
+          // already gone
+        }
+      }
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on('exit', (code, signal) => {
+      clearTimeout(timer);
+      const result = { stdout, stderr, code, signal };
+      if (matched) resolve(result);
+      else {
+        reject(new Error(
+          `exited ${code}/${signal} before ${pattern}\nstderr:\n${stderr}\nstdout:\n${stdout}`,
+        ));
+      }
+    });
+  });
+}
+
 test('reap：死 pid / 无 pid 且容器 available → close 一次；存活 pid 不 close', () => {
   const probed = py(`
 import json
@@ -575,6 +641,117 @@ exec sleep 120
   assert.equal(closeNotes(path.join(scratch, 'live-run')).filter((item) => item.code === 'slow-1').length, 1);
   const launch = JSON.parse(fs.readFileSync(path.join(liveWork, 'slow-1', '.fgs', 'dsh-launch.json'), 'utf8'));
   assert.equal(alive(launch.pid), false);
+});
+
+test('默认快照：未设 env 时 GRACE=60、GRACE_SOLVED=30、INTERVAL=20；显式覆盖仍优先', () => {
+  const probed = py(`
+import json
+import driver
+from supervisor.core import grace_settings
+print(json.dumps({
+  "grace": list(grace_settings()),
+  "interval": driver.supervisor_interval(),
+  "enabled": driver.supervisor_enabled(),
+}))
+`);
+  assert.equal(probed.status, 0, probed.stderr);
+  const body = JSON.parse(probed.stdout);
+  assert.deepEqual(body.grace, [60, 30]);
+  assert.equal(body.interval, 20);
+  assert.equal(body.enabled, true);
+
+  const overridden = py(`
+from supervisor.core import grace_settings
+print(grace_settings()[0])
+`, { CONTEST_RETIRE_GRACE: '180' });
+  assert.equal(overridden.status, 0, overridden.stderr);
+  assert.equal(overridden.stdout.trim(), '180');
+
+  const alias = py(`
+from supervisor.core import grace_settings
+print("%s %s" % grace_settings())
+`, { GRACE: '180', GRACE_SOLVED: '45' });
+  assert.equal(alias.status, 0, alias.stderr);
+  assert.equal(alias.stdout.trim(), '180 45');
+
+  const paused = py(`
+import driver
+print(driver.supervisor_interval())
+`, { CONTEST_SUPERVISOR_INTERVAL: '0' });
+  assert.equal(paused.status, 0, paused.stderr);
+  assert.equal(paused.stdout.trim(), '0.0');
+
+  const cliText = fs.readFileSync(cli, 'utf8');
+  assert.match(cliText, /os\.environ\.get\("CONTEST_SUPERVISOR_INTERVAL", "20"\) or "20"/);
+});
+
+test('G1：concludeTurn 被忽略时活 sleep 子进程过默认宽限仍被 driver 退休；10 秒内 hold', async () => {
+  // Runner view: the worker is still alive, so a host that ignored concludeTurn
+  // did not stop the process. Do not call helpers concludeTurn (that marks concluded).
+  const scratch = tmpDir('fgs-g1-');
+  const liveScript = writeDeferredSleeper(path.join(scratch, 'bin-live'), '2000-01-01T00:00:00Z');
+  const liveWork = path.join(scratch, 'live');
+  const liveRun = path.join(scratch, 'live-run');
+  const liveFixture = writeFixture(scratch, [
+    {
+      unique_code: 'g1-live',
+      description: '宿主忽略 conclude，进程仍活，过默认宽限应退休',
+      is_completed: false,
+      container_addr: ['http://10.2.0.3'],
+    },
+  ]);
+  const retired = run('python3', ['-u', driver], baseEnv({
+    CONTEST_FIXTURE: liveFixture,
+    CONTEST_WORKDIR: liveWork,
+    RUN: liveRun,
+    CONTEST_SUPERVISOR: '1',
+    CONTEST_WORKER_CMD: liveScript,
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    CONTEST_SUPERVISOR_NOW: '2026-01-01T00:00:00Z',
+  }));
+  assert.equal(retired.status, 0, `${retired.stderr}\n${retired.stdout}`);
+  assert.match(retired.stderr, /retire g1-live/);
+  assert.doesNotMatch(retired.stderr, /hold g1-live/);
+  assert.match(fs.readFileSync(path.join(liveRun, 'attempted', 'retired.txt'), 'utf8'), /g1-live/);
+  assert.equal(closeNotes(liveRun).filter((item) => item.code === 'g1-live').length, 1);
+  const liveLaunch = JSON.parse(fs.readFileSync(path.join(liveWork, 'g1-live', '.fgs', 'dsh-launch.json'), 'utf8'));
+  assert.equal(alive(liveLaunch.pid), false);
+
+  const holdScript = writeDeferredSleeper(path.join(scratch, 'bin-hold'), '2026-01-01T00:00:00Z');
+  const holdWork = path.join(scratch, 'hold');
+  const holdRun = path.join(scratch, 'hold-run');
+  const holdFix = path.join(scratch, 'hold-fix');
+  fs.mkdirSync(holdFix, { recursive: true });
+  const holdFixture = writeFixture(holdFix, [
+    {
+      unique_code: 'g1-hold',
+      description: '默认宽限内应 hold，进程继续活',
+      is_completed: false,
+      container_addr: ['http://10.2.0.4'],
+    },
+  ]);
+  const marker = path.join(holdWork, 'g1-hold', '.fgs', 'dsh-launch.json');
+  try {
+    const held = await runUntilMatch('python3', ['-u', driver], baseEnv({
+      CONTEST_FIXTURE: holdFixture,
+      CONTEST_WORKDIR: holdWork,
+      RUN: holdRun,
+      CONTEST_SUPERVISOR: '1',
+      CONTEST_WORKER_CMD: holdScript,
+      CONTEST_SUPERVISOR_INTERVAL: '0',
+      CONTEST_SUPERVISOR_NOW: '2026-01-01T00:00:10Z',
+    }), /hold g1-hold/);
+    assert.match(held.stderr, /hold g1-hold/);
+    assert.doesNotMatch(held.stderr, /retire g1-hold/);
+    const holdLaunch = JSON.parse(fs.readFileSync(marker, 'utf8'));
+    assert.equal(alive(holdLaunch.pid), true);
+    assert.equal(closeNotes(holdRun).length, 0);
+    assert.equal(fs.existsSync(path.join(holdRun, 'attempted', 'retired.txt')), false);
+  } finally {
+    if (fs.existsSync(marker)) {
+      killPid(JSON.parse(fs.readFileSync(marker, 'utf8')).pid);
+    }
+  }
 });
 
 test('sampler GC 只杀掉不属于存活 worker 的 monitor_sampler', () => {

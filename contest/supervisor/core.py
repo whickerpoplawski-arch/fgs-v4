@@ -231,9 +231,9 @@ def plan_reap(challenges, workers, codes=None, already_closed=None, *, include_d
 def plan_retire(workers, challenges, *, now: datetime, grace: int, grace_solved: int) -> list[dict]:
     """Kill, close, and maybe archive alive workers past their grace.
 
-    Deferred or solved meta uses ``grace`` (default 180). Platform
+    Deferred or solved meta uses ``grace`` (default 60). Platform
     ``is_completed`` with meta not yet ``solved`` uses the shorter
-    ``grace_solved`` (default 60). Dead workers are left for reap.
+    ``grace_solved`` (default 30). Dead workers are left for reap.
     """
     completed = set()
     for item in challenges or []:
@@ -654,6 +654,6 @@ def perform_close(run: Path, code: str, *, base: str, token: str, fixture: str |
 
 
 def grace_settings() -> tuple[int, int]:
-    grace = env_int(("CONTEST_RETIRE_GRACE", "GRACE"), 180)
-    solved = env_int(("CONTEST_RETIRE_GRACE_SOLVED", "GRACE_SOLVED"), 60)
+    grace = env_int(("CONTEST_RETIRE_GRACE", "GRACE"), 60)
+    solved = env_int(("CONTEST_RETIRE_GRACE_SOLVED", "GRACE_SOLVED"), 30)
     return grace, solved

@@ -600,7 +600,7 @@ def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base:
 
 
 def supervisor_interval() -> float:
-    raw = os.environ.get("CONTEST_SUPERVISOR_INTERVAL", "60").strip() or "60"
+    raw = os.environ.get("CONTEST_SUPERVISOR_INTERVAL", "20").strip() or "20"
     try:
         return max(0.0, float(raw))
     except ValueError as exc:
