@@ -291,7 +291,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 `contest/entrypoint.sh` 校验 token 与 base URL，然后 exec `contest/driver.py`。默认 `CONTEST_SUPERVISOR=1`：调度循环在 driver 进程里（子进程退出后 close、deferred / 平台已通关过宽限后 kill+close、存活 worker 和活跃容器都小于 3 才补派）。entrypoint **不**另起 `autosup.sh`。`CONTEST_SUPERVISOR=0` 时仍是下面这一次性 visit。driver 对每个未完成的 visit：
 
 1. `list_challenges`（跳过已通关）
-2. `start_challenge(unique_code)` → `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
+2. `POST {prefix}/challenges/start?unique_code={code}`（query，body `{}`；`prefix` 用 list 成功的那个，托管是 `/openapi/v1`）→ `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
 4. `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`
 5. 验收 `.fgs/competition.json` 的 `activeProblemId`，以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。不过则不拉 dsh
