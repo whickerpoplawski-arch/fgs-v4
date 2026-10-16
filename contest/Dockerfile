@@ -16,6 +16,9 @@
 # image and set CONTEST_DSH_LAUNCH=1. Until then the driver still pre-seeds
 # `.fgs/` and records a dsh launch stub.
 #
+# The driver also runs the contest supervisor (reap / retire / dual-guard).
+# Do not add a second autosup process to this image.
+#
 #   docker build -f contest/Dockerfile -t fgs-contest .
 #   docker save fgs-contest:latest | gzip > agent.tar.gz
 FROM node:22-bookworm-slim
@@ -26,7 +29,7 @@ RUN apt-get update \
 
 WORKDIR /opt/fgs
 COPY . .
-RUN chmod +x contest/entrypoint.sh \
+RUN chmod +x contest/entrypoint.sh contest/supervisor/*.sh \
  && mkdir -p /var/lib/fgs-contest
 
 # Per-challenge cwds. Token and base URL stay out of the image.

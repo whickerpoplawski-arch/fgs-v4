@@ -145,7 +145,7 @@ io-specs/                   # LLM 工具 I/O 预制规范
 schemas/tools/              # Decide/Execute 工具 JSON Schema
 prompts/                    # Decide/Execute 系统骨架；apply 时读入并注入 fgs-graph
 tools/                      # submit_flag.mjs（赛方提交）+ bootstrap_project.mjs（无 LLM 写盘种题）
-contest/                    # hosted 入口：entrypoint.sh + driver.py + Dockerfile 示例
+contest/                    # hosted 入口：entrypoint.sh + driver.py + supervisor/ + Dockerfile 示例
 tests/                      # node --test（离线，无外部依赖）
 tests/fixtures/             # 含 fgs-v3-baseline.index.js（gen9 冻结基线，供对抗测试做集合差）
 docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES / FIXES.patch（历史记录，不参与运行）
@@ -256,12 +256,19 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_FIXTURE` | 离线 | 指向 challenges JSON，不访问平台。正式托管不要设 |
 | `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。竞赛 profile 必须走 **openai-completions**（responses 流式会丢 function_call） |
 | `BENCHMARK_API_PREFIX` | 可选 | 不设时 list/start 先试 `/api/v1`，再试 `/openapi/v1`（与 `tools/submit_flag.mjs` 的提交路径同族） |
+| `RUN` | 可选 | 监管根目录（`workers/`、`monitor/`、`attempted/`）。不设时 entrypoint 用 `CONTEST_WORKDIR` |
+| `CONTEST_SUPERVISOR` | 默认开 | `1`：driver 内循环做 reap / retire / 双护栏补派。`0` 关闭，回到一次性 visit（本地单测） |
+| `CONTEST_MAX_ACTIVE` | 默认 3 | 同时存活 worker 与平台活跃容器的上限。超过 3 压到平台 cap。未设时沿用 `CONTEST_MAX_CONCURRENCY` |
+| `CONTEST_RETIRE_GRACE` | 默认 180 | deferred / 本地已 solved 的退休宽限（秒） |
+| `CONTEST_RETIRE_GRACE_SOLVED` | 默认 60 | 平台 `is_completed` 但本地 meta 还不是 solved 时的短宽限（秒） |
+
+行为说明见 [`contest/SUPERVISOR.md`](contest/SUPERVISOR.md)。Token 与 base URL 只在运行时注入，不要写进镜像。
 
 本地单题调试可以用 `FGS_PROBLEM_ID` / `FGS_BRIEF` / `FGS_WORKSPACE` 调 `bootstrap_project.mjs`。托管题面真源是 Challenges API 的 `unique_code` 和 `description`，不是这些变量。
 
 ### 启动后的磁盘预种顺序
 
-`contest/entrypoint.sh` 校验 token 与 base URL，然后 exec `contest/driver.py`。driver 对每个未完成的 visit：
+`contest/entrypoint.sh` 校验 token 与 base URL，然后 exec `contest/driver.py`。默认 `CONTEST_SUPERVISOR=1`：调度循环在 driver 进程里（子进程退出后 close、deferred / 平台已通关过宽限后 kill+close、存活 worker 和活跃容器都小于 3 才补派）。entrypoint **不**另起 `autosup.sh`。`CONTEST_SUPERVISOR=0` 时仍是下面这一次性 visit。driver 对每个未完成的 visit：
 
 1. `list_challenges`（跳过已通关）
 2. `start_challenge(unique_code)` → `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
@@ -293,7 +300,7 @@ docker build -f contest/Dockerfile -t fgs-contest .
 离线验收（无模型、无平台）：
 
 ```bash
-node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs
+node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs
 ```
 
 ## 契约对照
