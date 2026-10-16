@@ -1,3 +1,15 @@
+## 这几天最重要
+
+装插件、做自己的竞赛镜像，先核对这五条：
+
+1. **模型**：只用 `openai-completions`（`responses` 流式会丢 `function_call`）。provider id 不要用 `deepseek-official`，换成唯一 id，例如 `deepseek-contest`。
+2. **托管上传环境变量**：只填 `DEEPSEEK_API_KEY` 和 `SOLVER_GATEWAY=1`。不要设 `BENCHMARK_*`（平台运行时注入）。
+3. **镜像要能跑 bash**：安装 `bubblewrap`（`bwrap`），和/或把 DSH 默认权限设成 `danger-full-access`，`approval.policy` 设为 `never`。
+4. **打靶**：用 `bash` / `curl` 打挑战目标。`web_fetch` 会拒私网 IP（`10.0.177.x`）。
+5. **开题**：`POST .../challenges/start?unique_code=`（`unique_code` 放在 query）。`5624fa3` 已经是这个写法。
+
+---
+
 # fgs-deepseek — DSH 原生插件（FGS 黑板）
 
 把 `CONTRACT.md` 冻结的 **FGS 黑板**（Fact → Step → Fact）做成 DeepSeek Harness 的**原生插件**：
