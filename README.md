@@ -320,7 +320,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 2. `POST {prefix}/challenges/start?unique_code={code}`（query，body `{}`；`prefix` 用 list 成功的那个，托管是 `/openapi/v1`）→ `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
 4. 按本遍选 profile（`profile_for_visit`）。默认 `on_fail`：新题用 `contest-baseline`，忽略 `CONTEST_FGS_AFTER_SEC`。失败二遍才用 `contest`。`mode=after_sec` 才按 driver 启动时钟走旧的 `profile_for_now`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。二遍还会把 baseline 产物补成 Fact / Intent（`tools/apply_enrich.mjs`）
-5. 把对手 Solver 任务书写入 `prompt.txt`（纪律段逐字，题目块来自 list/start）。两边都写这份任务书。任务书含输出纪律：工具调用前可见文字 ≤2 句，通关后只交 flag 加一句结论。
+5. 把对手 Solver 任务书写入 `prompt.txt`（纪律段逐字，题目块来自 list/start）。两边都写这份任务书。任务书含输出纪律：工具调用前可见文字 ≤2 句，通关后只交 flag 加一句结论。运行时轻约束（`agent/pre-step` 注入，不是新 tool）见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)「Baseline 轻约束」。
 6. 拉起 `dsh --profile <选中的 profile> --json prompt.txt`（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub。`.fgs/dsh-launch.json` 记录 `protocol: anthropic_messages`、`provider: deepseek-official` 和选中的 profile
 
 写盘复用 `ProjectRegistry`、`GraphStore`、`Controller.apply(seedOriginOp)`，不另造图格式。有 `target` 时 origin 正文与 `/fgs new` 一样是 `{target, brief}` 的 JSON。已有 `fact_origin` + `goal_final` 时第二次调用 **幂等成功**，不覆盖图（之后 Decide 写下的 step 还在）。缺 brief、id 非法、cwd 不可写则 exit 1。
@@ -346,7 +346,7 @@ docker build -f contest/Dockerfile -t fgs-contest .
 离线验收（无模型、无平台）：
 
 ```bash
-node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs tests/contest_fail_then_fgs.test.mjs
+node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs tests/contest_fail_then_fgs.test.mjs tests/contest_light_constraint.test.mjs
 ```
 
 ## 契约对照

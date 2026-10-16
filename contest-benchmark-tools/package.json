@@ -3,10 +3,11 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "TSecBench baseline tools: benchmark_get_progress, benchmark_submit_flag, record_observation.",
+  "description": "TSecBench baseline tools plus harness-level light constraint (pre-step inject, not a model-facing tool).",
   "exports": {
     ".": "./index.js",
-    "./api": "./api.js"
+    "./api": "./api.js",
+    "./light_constraint": "./light_constraint.js"
   },
   "dsh": {
     "bundle": {
