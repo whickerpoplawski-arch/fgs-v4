@@ -36,8 +36,12 @@ function writeFixture(dir, challenges) {
 }
 
 function profileSelect(envExtra, elapsed) {
+  const mode = Object.prototype.hasOwnProperty.call(envExtra, 'CONTEST_FGS_MODE')
+    ? envExtra.CONTEST_FGS_MODE
+    : 'after_sec';
   const script = [
     'import json, os, driver',
+    `os.environ["CONTEST_FGS_MODE"] = ${JSON.stringify(mode)}`,
     `os.environ["CONTEST_FGS_AFTER_SEC"] = ${JSON.stringify(envExtra.CONTEST_FGS_AFTER_SEC)}`,
     'if "CONTEST_DSH_PROFILE" in os.environ and not os.environ["CONTEST_DSH_PROFILE"]:',
     '    os.environ.pop("CONTEST_DSH_PROFILE")',
@@ -150,6 +154,7 @@ test('A5 FGS visit still bootstraps and asserts the graph', () => {
     CONTEST_WORKDIR: workdir,
     CONTEST_DSH_LAUNCH: '0',
     CONTEST_SUPERVISOR: '0',
+    CONTEST_FGS_MODE: 'after_sec',
     CONTEST_FGS_AFTER_SEC: '0',
     SOLVER_GATEWAY: '0',
   });

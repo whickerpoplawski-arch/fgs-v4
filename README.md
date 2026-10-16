@@ -7,7 +7,7 @@
 3. **镜像要能跑 bash**：安装 `bubblewrap`（`bwrap`），和/或把 DSH 默认权限设成 `danger-full-access`，`approval.policy` 设为 `never`。
 4. **打靶**：用 `bash` / `curl` 打挑战目标。`web_fetch` 会拒私网 IP（`10.0.177.x`）。
 5. **开题**：`POST .../challenges/start?unique_code=`（`unique_code` 放在 query）。`5624fa3` 已经是这个写法。
-6. **交 flag（SCORE）**：baseline（`contest-baseline`）用 `benchmark_submit_flag` 一跳 `POST …/challenges/submit`，不经过 `fgs_satisfy_goal`。FGS profile（到点后的新 worker）仍把插件 `cordis.patch.yml` 保持 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`；同一 profile 也挂了 `benchmark_*`，Decide 放行这三个工具。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 POST submit，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
+6. **交 flag（SCORE）**：baseline（`contest-baseline`，新题默认）用 `benchmark_submit_flag` 一跳 `POST …/challenges/submit`，不经过 `fgs_satisfy_goal`。FGS profile（失败题的二遍，不是墙钟到点）仍把插件 `cordis.patch.yml` 保持 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`；同一 profile 也挂了 `benchmark_*`，Decide 放行这三个工具。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 POST submit，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
 
 ---
 
@@ -92,7 +92,7 @@ Installing this plugin into a profile bundle only provides the **FGS tools and t
 TSecBench 托管容器在插件之外还要：
 
 - **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` →（仅 FGS profile）磁盘预种 → Solver 任务书 → `dsh --profile <contest-baseline|contest>`。baseline 不预种。FGS 预种在任何模型回合之前完成。
-- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`。前 `CONTEST_FGS_AFTER_SEC` 秒（默认 7200）新 worker 用 `contest-baseline`；之后新 worker 用 `contest`。不热挂载，不为切换杀正在跑的 worker。
+- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`、`CONTEST_FGS_MODE=on_fail`。新题用 `contest-baseline`。只有失败题的二遍用 `contest`。不热挂载，不为切换杀正在跑的 worker。`CONTEST_FGS_AFTER_SEC` 只在 `mode=after_sec` 时生效。
 - **不要设置** `BENCHMARK_*`，也不要在上传页写全局 `FGS_UNIQUE_CODE`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入。
 - **交 flag**：baseline 走 `benchmark_submit_flag`（同一 POST submit）。FGS 插件仍保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`。
 - 竞赛 profile 用 **stock Messages**：`provider: deepseek-official`，`baseURL: https://api.deepseek.com/anthropic`。`SOLVER_GATEWAY=1` 只改写模型基址（`https://api.deepseek.com/anthropic` → `http://api.deepseek.com.tsecbench.gw/anthropic`），不改 `BENCHMARK_*` 和 Challenges API。不要把 `deepseek-official` 配成 `openai-completions`。
@@ -290,10 +290,14 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_WORKDIR` | 可选 | 每题一个子目录。默认 `<仓库>/contest-work` |
 | `CONTEST_FIXTURE` | 离线 | 指向 challenges JSON，不访问平台。正式托管不要设 |
 | `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。profile 用 stock Messages（`deepseek-official`），不要把该 id patch 成 openai-completions |
-| `CONTEST_DSH_PROFILE` | `contest-baseline` | 未到点时新 worker 的 `--profile`。bundles 不含 FGS |
-| `CONTEST_DSH_PROFILE_FGS` | `contest` | 到点后新 worker 的 `--profile`。含 FGS + `benchmark_*` |
-| `CONTEST_FGS_AFTER_SEC` | `7200` | driver 启动起算。`>=` 之后的新 worker 用 FGS profile。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
-| `CONTEST_SKIP_FGS_SEED` | `auto` | 仅 FGS profile 预种。baseline 跳过 bootstrap |
+| `CONTEST_DSH_PROFILE` | `contest-baseline` | 新题一遍的 `--profile`。bundles 不含 FGS |
+| `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 `--profile`。含 FGS + `benchmark_*` |
+| `CONTEST_FGS_MODE` | `on_fail` | 新题保持 baseline。失败（进程已死、deferred 过宽限、或可选预算超时）才 FIFO 二遍。`after_sec` 是旧墙钟且不重试。`off` 永不 FGS |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | **仅 `mode=after_sec`。** `on_fail` 忽略。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
+| `CONTEST_FGS_RETRY_LAST` | `1` | 有新题时不跑 FGS |
+| `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
+| `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数 |
+| `CONTEST_SKIP_FGS_SEED` | `auto` | 仅 FGS profile 预种。baseline 跳过 bootstrap。二遍在预种后按 baseline 产物补图 |
 | `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书的时间预算（分钟） |
 | `BENCHMARK_API_PREFIX` | 可选 | 不设时 list/start 先试 `/api/v1`，再试 `/openapi/v1`（与 `tools/submit_flag.mjs` 的提交路径同族） |
 | `RUN` | 可选 | 监管根目录（`workers/`、`monitor/`、`attempted/`）。不设时 entrypoint 用 `CONTEST_WORKDIR` |
@@ -315,7 +319,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 1. `list_challenges`（跳过已通关）
 2. `POST {prefix}/challenges/start?unique_code={code}`（query，body `{}`；`prefix` 用 list 成功的那个，托管是 `/openapi/v1`）→ `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
-4. 按 driver 启动时钟选 profile（`profile_for_now`，每次 visit 现算）。未到 `CONTEST_FGS_AFTER_SEC` 用 `contest-baseline`，到点后的新 worker 用 `contest`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`
+4. 按本遍选 profile（`profile_for_visit`）。默认 `on_fail`：新题用 `contest-baseline`，忽略 `CONTEST_FGS_AFTER_SEC`。失败二遍才用 `contest`。`mode=after_sec` 才按 driver 启动时钟走旧的 `profile_for_now`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。二遍还会把 baseline 产物补成 Fact / Intent（`tools/apply_enrich.mjs`）
 5. 把对手 Solver 任务书写入 `prompt.txt`（纪律段逐字，题目块来自 list/start）。两边都写这份任务书
 6. 拉起 `dsh --profile <选中的 profile> --json prompt.txt`（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub。`.fgs/dsh-launch.json` 记录 `protocol: anthropic_messages`、`provider: deepseek-official` 和选中的 profile
 
@@ -342,7 +346,7 @@ docker build -f contest/Dockerfile -t fgs-contest .
 离线验收（无模型、无平台）：
 
 ```bash
-node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs
+node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs tests/contest_fail_then_fgs.test.mjs
 ```
 
 ## 契约对照

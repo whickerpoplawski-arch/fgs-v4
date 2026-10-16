@@ -36,7 +36,8 @@ RUN chmod +x contest/entrypoint.sh contest/supervisor/*.sh \
 
 # Per-challenge cwds. Token and base URL stay out of the image.
 # Messages root is /anthropic, not the chat /v1 root (that path 404s).
-# New workers use contest-baseline until CONTEST_FGS_AFTER_SEC, then contest.
+# New challenges stay on contest-baseline. FGS is the fail-retry pass.
+# CONTEST_FGS_AFTER_SEC is ignored unless CONTEST_FGS_MODE=after_sec.
 ENV CONTEST_WORKDIR=/var/lib/fgs-contest \
     DSH_HOME=/opt/dsh \
     DSH_PERMISSION_MODE=danger-full-access \
@@ -44,7 +45,11 @@ ENV CONTEST_WORKDIR=/var/lib/fgs-contest \
     CONTEST_DSH_LAUNCH=1 \
     CONTEST_DSH_PROFILE=contest-baseline \
     CONTEST_DSH_PROFILE_FGS=contest \
+    CONTEST_FGS_MODE=on_fail \
     CONTEST_FGS_AFTER_SEC=7200 \
+    CONTEST_FGS_RETRY_LAST=1 \
+    CONTEST_FGS_MAX_ACTIVE=1 \
+    CONTEST_FGS_MAX_RETRIES=1 \
     CONTEST_SUPERVISOR=1 \
     CONTEST_MAX_ACTIVE=3 \
     CONTEST_RETIRE_GRACE=60 \
