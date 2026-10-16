@@ -118,7 +118,7 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 ## 本地烟囱（无平台、无真 key）
 
 ```bash
-node --test tests/contest_baseline.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_fail_then_fgs.test.mjs
+node --test tests/contest_baseline.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_fail_then_fgs.test.mjs tests/contest_light_constraint.test.mjs
 ```
 
 A1–A3 锁的是 `CONTEST_FGS_MODE=after_sec` 的墙钟。`on_fail` 忽略墙钟、失败入队、FIFO、补图，都在 `tests/contest_fail_then_fgs.test.mjs`。close 超时仍在 `tests/contest_supervisor.test.mjs`。
@@ -140,3 +140,31 @@ A1–A3 锁的是 `CONTEST_FGS_MODE=after_sec` 的墙钟。`on_fail` 忽略墙�
 - 多 flag：Solver 任务书要求看 `correct_flag_count` / `total_flag_count`。`CONTEST_RETIRE_GRACE_SOLVED` 只在平台判定通关后缩短宽限，不要在 1/N 时当 solved 关掉。
 - Solver 任务书另有输出纪律：工具调用前可见文字 ≤2 句，通关后只交 flag 加一句结论。
 - 标题旁路会话（`Generate the session title`）两边都有。统计只计解题会话。
+
+---
+
+## Baseline 轻约束
+
+这是 **harness / Cordis 钩子**，不是新的模型 tool，也不装 `dsh-routing-suite` / graded / super-injector。`prompt.txt` 里的「输出纪律」（PR#14）仍是软契约；本层用 `agent/pre-step` 在 `next()` 之后 `enter` 一批 sourced user message（`source.kind=plugin`），保证写进**本步 admitted request**。不改 `thinking: disabled`，不改 Fail-then-FGS 队列。
+
+挂在已有的 `@local/contest-benchmark-tools`（baseline 与 contest 都会加载）。`inject` 仍只有 `['tools']`：`ctx.on('agent/pre-step')` 不需要 `agents` 服务，避免和 FGS profile 抢依赖。关总开关即可做 A/B。
+
+| Knob | 默认 | 谁读 | 说明 |
+|---|---|---|---|
+| `CONTEST_LIGHT_CONSTRAINT` | `1` | Cordis plugin | `0` / `off` / `false` / `no` 关闭 L1–L3 |
+| `CONTEST_LIGHT_NOTES` | `1` | 同上 | L1：每步注入「≤2 句→工具、禁复读」；若 cwd 有 `NOTES.md` / `.fgs/notes.md`（或 observations 尾）附末尾 ≤400 字 |
+| `CONTEST_LIGHT_LOOP_BREAK` | `1` | 同上 | L2：连续 N 步 assistant 文本或 bash/工具指纹相似则注入「换攻击面」，并可用现有 `record_observation` 记一条 |
+| `CONTEST_LIGHT_LOOP_N` | `3` | 同上 | 连续相似步阈值（≥2） |
+| `CONTEST_LIGHT_ANCHORS` | `1` | 同上 | L3：静态三锚（回顾 / 收敛 / 反跑题）。可关 |
+
+driver 把父进程环境原样拷给 worker，不必再为这些名字改调度代码。镜像 Dockerfile 已带同名默认。平台若清空未声明变量，插件仍按上表默认开启。
+
+```bash
+CONTEST_LIGHT_CONSTRAINT=1
+CONTEST_LIGHT_NOTES=1
+CONTEST_LIGHT_LOOP_BREAK=1
+CONTEST_LIGHT_LOOP_N=3
+CONTEST_LIGHT_ANCHORS=1
+```
+
+A/B：`CONTEST_LIGHT_CONSTRAINT=0`。环状态在本题 cwd 的 `.fgs/light_constraint_state.json`，不污染平台。离线单测：`tests/contest_light_constraint.test.mjs`。

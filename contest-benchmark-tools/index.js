@@ -2,6 +2,8 @@
  * Host bundle: bash stays in dsh-base. These three names are the Solver brief.
  * benchmark_submit_flag posts straight at Challenges. It does not call
  * fgs_satisfy_goal or the satisfy hook.
+ *
+ * Also hosts Baseline 轻约束 (pre-step inject, not a model-facing tool).
  */
 import {
   getProgress,
@@ -9,8 +11,10 @@ import {
   resolveUniqueCode,
   submitFlag,
 } from './api.js';
+import { applyLightConstraint } from './light_constraint.js';
 
 export const name = 'contest-benchmark-tools';
+/** Tools only. Light-constraint hooks use ctx.on; agent comes from the event payload. */
 export const inject = ['tools'];
 
 function text(value) {
@@ -111,6 +115,9 @@ export function apply(ctx) {
     },
     run: async (args, exec) => jsonResult(recordObservation({ cwd: cwdOf(exec), note: args.note })),
   }));
+
+  const lightDispose = applyLightConstraint(ctx);
+  if (typeof lightDispose === 'function') disposers.push(lightDispose);
 
   return () => {
     for (const dispose of disposers) dispose();
