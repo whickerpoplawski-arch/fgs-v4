@@ -87,6 +87,7 @@ test('SOLVER_GATEWAY=1 不改写 BENCHMARK_BASE_URL，DEEPSEEK_BASE_URL 走 *.ts
     '        seen["hits"].append({',
     '            "method": self.command,',
     '            "path": self.path.split("?")[0],',
+    '            "raw": self.path,',
     '            "token": self.headers.get("BENCHMARK_TOKEN"),',
     '        })',
     '        body = b\'[{"unique_code":"a-1","is_completed":true}]\'',
@@ -109,7 +110,7 @@ test('SOLVER_GATEWAY=1 不改写 BENCHMARK_BASE_URL，DEEPSEEK_BASE_URL 走 *.ts
     'port = server.server_address[1]',
     'local = f"http://127.0.0.1:{port}"',
     'driver._request("GET", local + "/openapi/v1/challenges", "secret-token")',
-    'driver._request("POST", local + "/openapi/v1/challenges/start", "secret-token", {"unique_code": "a-1"})',
+    'driver._request("POST", local + "/openapi/v1/challenges/start?unique_code=a-1", "secret-token", {})',
     'core.request_json("POST", local + "/openapi/v1/challenges/close?unique_code=a-1", "secret-token", {})',
     'server.shutdown()',
     'probe = urllib.request.Request("http://127.0.0.1/openapi/v1/challenges", method="GET")',
@@ -157,6 +158,9 @@ test('SOLVER_GATEWAY=1 不改写 BENCHMARK_BASE_URL，DEEPSEEK_BASE_URL 走 *.ts
     ['/openapi/v1/challenges', '/openapi/v1/challenges/start', '/openapi/v1/challenges/close'],
   );
   assert.deepEqual(cases.hits.map((hit) => hit.token), ['secret-token', 'secret-token', 'secret-token']);
+  assert.equal(cases.hits[1].raw, '/openapi/v1/challenges/start?unique_code=a-1');
+  assert.match(cases.hits[1].raw, /unique_code=/);
+  assert.equal(cases.hits[2].raw, '/openapi/v1/challenges/close?unique_code=a-1');
   assert.ok(cases.headerNames.includes('BENCHMARK_TOKEN'));
   assert.match(cases.refused, /BENCHMARK_BASE_URL/);
   assert.match(result.stderr, /rewrote DEEPSEEK_BASE_URL: https:\/\/api\.deepseek\.com\/v1 → http:\/\/api\.deepseek\.com\.tsecbench\.gw\/v1/);
@@ -211,6 +215,219 @@ test('平台已注入 *.tsecbench.gw 的 BENCHMARK_BASE_URL 时允许 list，DEE
   assert.match(result.stderr, /BENCHMARK_BASE_URL unchanged: http:\/\/tsecbench\.zc\.tencent\.com\.tsecbench\.gw/);
   assert.doesNotMatch(result.stderr, /rewrote BENCHMARK/);
   assert.doesNotMatch(result.stderr, /refusing Challenges API URL/);
+});
+
+test('start_challenge_live 把 unique_code 放在 query 上，不走 path start', () => {
+  const script = `
+import json, os, tempfile, threading, urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+import driver
+from supervisor import core
+
+os.environ.pop("PLATFORM_BASE_URL", None)
+os.environ["SOLVER_GATEWAY"] = "0"
+os.environ["CONTEST_DSH_LAUNCH"] = "0"
+os.environ["CONTEST_SUPERVISOR"] = "0"
+os.environ.pop("CONTEST_FIXTURE", None)
+os.environ["BENCHMARK_TOKEN"] = "secret-token"
+
+seen = {"hits": []}
+
+def split_target(raw):
+    parts = urllib.parse.urlsplit(raw)
+    return parts.path, urllib.parse.parse_qs(parts.query)
+
+class Handler(BaseHTTPRequestHandler):
+    def _body(self):
+        length = int(self.headers.get("content-length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def _record(self, raw):
+        path, query = split_target(self.path)
+        seen["hits"].append({
+            "method": self.command,
+            "path": self.path,
+            "route": path,
+            "query": query,
+            "body": raw.decode("utf-8"),
+            "token": self.headers.get("BENCHMARK_TOKEN"),
+            "authorization": self.headers.get("Authorization"),
+        })
+
+    def _send(self, status, payload):
+        data = json.dumps(payload).encode("utf-8")
+        self.send_response(status)
+        self.send_header("content-type", "application/json")
+        self.send_header("content-length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        raw = self._body()
+        self._record(raw)
+        path, _query = split_target(self.path)
+        if path == "/openapi/v1/challenges":
+            self._send(200, {"challenges": [{
+                "unique_code": "e1-02",
+                "description": "demo",
+                "is_completed": False,
+            }]})
+            return
+        self._send(404, {"detail": "Not Found"})
+
+    def do_POST(self):
+        raw = self._body()
+        self._record(raw)
+        path, query = split_target(self.path)
+        # Path form is not a start route on this platform.
+        if path.endswith("/start") and not path.endswith("/challenges/start"):
+            self._send(404, {"detail": "Not Found"})
+            return
+        if path in ("/openapi/v1/challenges/start", "/api/v1/challenges/start"):
+            code = (query.get("unique_code") or [None])[0]
+            if not code:
+                self._send(422, {"detail": [{
+                    "type": "missing",
+                    "loc": ["query", "unique_code"],
+                    "msg": "Field required",
+                    "input": None,
+                }]})
+                return
+            if path == "/api/v1/challenges/start" and code == "fallback-1":
+                self._send(404, {"detail": "Not Found"})
+                return
+            self._send(200, {"container_addr": ["http://10.0.0.1:80"]})
+            return
+        self._send(404, {"detail": "Not Found"})
+
+    def log_message(self, fmt, *args):
+        return
+
+server = HTTPServer(("127.0.0.1", 0), Handler)
+thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True)
+thread.start()
+base = "http://127.0.0.1:%s" % server.server_address[1]
+os.environ["BENCHMARK_BASE_URL"] = base
+payload = {}
+try:
+    prefix, _challenges = driver.list_challenges_live(base, "secret-token")
+    addrs = driver.start_challenge_live(base, prefix, "secret-token", "e1-02")
+    live_hits = list(seen["hits"])
+    before_api = len(seen["hits"])
+    api_addrs = driver.start_challenge_live(base, "/api/v1", "secret-token", "a-01")
+    api_hits = seen["hits"][before_api:]
+    before_empty = len(seen["hits"])
+    empty_addrs = driver.start_challenge_live(base, "", "secret-token", "fallback-1")
+    empty_hits = seen["hits"][before_empty:]
+    body_only = ""
+    try:
+        driver._request(
+            "POST",
+            base + "/openapi/v1/challenges/start",
+            "secret-token",
+            {"unique_code": "e1-02"},
+        )
+    except driver.DriverError as exc:
+        body_only = str(exc)
+    path_only = ""
+    try:
+        driver._request(
+            "POST",
+            base + "/openapi/v1/challenges/e1-02/start",
+            "secret-token",
+            {},
+        )
+    except driver.DriverError as exc:
+        path_only = str(exc)
+    workdir = Path(tempfile.mkdtemp())
+    visited = driver.visit(
+        {"unique_code": "e1-02", "description": "demo", "is_completed": False},
+        base=base,
+        prefix=prefix,
+        token="secret-token",
+        workdir=workdir,
+        fixture=False,
+    )
+    os.environ["BENCHMARK_BASE_URL"] = "http://tsecbench.zc.tencent.com.tsecbench.gw"
+    os.environ.pop("PLATFORM_BASE_URL", None)
+    allowed = core.challenge_url(
+        os.environ["BENCHMARK_BASE_URL"],
+        "/openapi/v1/challenges/start?unique_code=e1-02",
+    )
+    foreign = ""
+    try:
+        driver.start_challenge_live(
+            "http://api.deepseek.com.tsecbench.gw",
+            "/openapi/v1",
+            "secret-token",
+            "e1-02",
+        )
+    except driver.DriverError as exc:
+        foreign = str(exc)
+    payload = {
+        "prefix": prefix,
+        "addrs": addrs,
+        "liveHits": live_hits,
+        "apiAddrs": api_addrs,
+        "apiHits": api_hits,
+        "emptyAddrs": empty_addrs,
+        "emptyHits": empty_hits,
+        "bodyOnly": body_only,
+        "pathOnly": path_only,
+        "visitOk": bool(visited.get("ok")),
+        "visitStatus": visited.get("status") or "",
+        "visitError": visited.get("error") or "",
+        "allowed": allowed,
+        "foreign": foreign,
+    }
+finally:
+    server.shutdown()
+print(json.dumps(payload))
+`;
+  const result = runPython(['-c', script], { PYTHONPATH: path.join(repoRoot, 'contest') });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const cases = JSON.parse(result.stdout);
+  assert.equal(cases.prefix, '/openapi/v1');
+  assert.deepEqual(cases.addrs, ['http://10.0.0.1:80']);
+  const posts = cases.liveHits.filter((hit) => hit.method === 'POST');
+  assert.equal(posts.length, 1);
+  assert.equal(posts[0].path, '/openapi/v1/challenges/start?unique_code=e1-02');
+  assert.equal(posts[0].route, '/openapi/v1/challenges/start');
+  assert.deepEqual(posts[0].query.unique_code, ['e1-02']);
+  assert.equal(posts[0].body, '{}');
+  assert.equal(posts[0].token, 'secret-token');
+  assert.equal(posts[0].authorization, 'Bearer secret-token');
+  assert.equal(
+    cases.liveHits.some((hit) => /\/challenges\/[^/]+\/start/.test(hit.route)),
+    false,
+  );
+  assert.match(cases.bodyOnly, /HTTP 422/);
+  assert.match(cases.bodyOnly, /\["query", "unique_code"\]/);
+  assert.match(cases.pathOnly, /HTTP 404/);
+  assert.match(cases.pathOnly, /\/challenges\/e1-02\/start/);
+  assert.deepEqual(cases.apiAddrs, ['http://10.0.0.1:80']);
+  assert.equal(cases.apiHits.length, 1);
+  assert.equal(cases.apiHits[0].path, '/api/v1/challenges/start?unique_code=a-01');
+  assert.equal(cases.apiHits[0].body, '{}');
+  assert.deepEqual(cases.emptyAddrs, ['http://10.0.0.1:80']);
+  assert.deepEqual(
+    cases.emptyHits.map((hit) => hit.path),
+    [
+      '/api/v1/challenges/start?unique_code=fallback-1',
+      '/openapi/v1/challenges/start?unique_code=fallback-1',
+    ],
+  );
+  assert.equal(cases.visitOk, true, cases.visitError);
+  assert.equal(cases.visitStatus, 'seeded');
+  assert.doesNotMatch(result.stderr, /HTTP 422/);
+  assert.match(result.stderr, /visit e1-02 seeded/);
+  assert.equal(
+    cases.allowed,
+    'http://tsecbench.zc.tencent.com.tsecbench.gw/openapi/v1/challenges/start?unique_code=e1-02',
+  );
+  assert.match(cases.foreign, /BENCHMARK_BASE_URL/);
+  assert.match(cases.foreign, /api\.deepseek\.com\.tsecbench\.gw/);
 });
 
 test('submit_flag 在提交请求上带 BENCHMARK_TOKEN', async () => {

@@ -436,19 +436,27 @@ def list_challenges_live(base: str, token: str):
 
 
 def start_challenge_live(base: str, prefix: str, token: str, code: str) -> list[str]:
-    encoded = urllib.parse.quote(code, safe="")
-    candidates = [
-        (prefix + "/challenges/start", {"unique_code": code}),
-        (prefix + f"/challenges/{encoded}/start", {"unique_code": code}),
-    ]
+    """POST ``{prefix}/challenges/start?unique_code=`` with body ``{}``.
+
+    Hosted FastAPI requires ``unique_code`` as a query parameter. A JSON body
+    alone is HTTP 422 (``loc`` is ``["query", "unique_code"]``). The path form
+    ``/challenges/{code}/start`` is HTTP 404 on this platform and is not called.
+
+    ``prefix`` is the one ``list_challenges_live`` already selected
+    (``/openapi/v1`` on the hosted bench). An empty prefix retries
+    ``api_prefixes()`` with the same query shape, including ``/api/v1``.
+    """
+    query = urllib.parse.urlencode({"unique_code": code})
+    prefixes = [prefix] if prefix else api_prefixes()
     errors = []
-    for path, body in candidates:
+    for item in prefixes:
+        path = f"{item}/challenges/start?{query}"
         try:
             url = challenge_url(base, path)
         except SupervisorError as exc:
             raise DriverError(str(exc)) from exc
         try:
-            _status, payload = _request("POST", url, token, body)
+            _status, payload = _request("POST", url, token, {})
         except DriverError as exc:
             errors.append(str(exc))
             continue
