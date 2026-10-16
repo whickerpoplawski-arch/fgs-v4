@@ -7,9 +7,12 @@ about 3 (platform cap). Per visit, before any model turn:
   list → start → mkdir workdir/<id> → (FGS profile only) bootstrap → solver brief → dsh
 
 ``contest-baseline`` does not load the FGS bundle and does not pre-seed a graph.
-``contest`` still pre-seeds ``fact_origin`` / ``goal_final`` for workers started
-after ``CONTEST_FGS_AFTER_SEC``. The choice is per new worker. A running worker
-is not hot-swapped and is not killed to change profiles.
+The default mode (``CONTEST_FGS_MODE=on_fail``) keeps every new challenge on
+that baseline. A challenge gets profile ``contest`` only on a later FGS pass,
+after the narrow fail rule puts it on the FIFO retry queue. ``after_sec`` keeps
+the old wall-clock switch (``CONTEST_FGS_AFTER_SEC``) and does not retry.
+The choice is per new worker. A running worker is not hot-swapped and is not
+killed to change profiles.
 
 `dsh` is not vendored here. Unless CONTEST_DSH_LAUNCH=1 and `dsh` is on PATH,
 the launch step records a stub under `.fgs/dsh-launch.json`.
@@ -59,6 +62,31 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from fail_graph import collect_enrich
+from fail_queue import (
+    bump_failed_at,
+    discard_unclassified,
+    fail_on_budget,
+    failure_reason,
+    fgs_done,
+    fgs_max_active,
+    fgs_max_retries,
+    fgs_mode,
+    fgs_retry_last,
+    list_unclassified,
+    mark_first_pass_done,
+    mark_first_pass_started,
+    note_fgs_dispatch,
+    park_unclassified,
+    plan_budget_retire,
+    queue_fgs,
+    queue_new,
+    register_fail,
+    safe_code,
+    select_dispatch,
+    snapshot_artifacts,
+    stamp_utc,
+)
 from solver_brief import challenge_fields, render_solver_brief
 from supervisor.core import (
     PlatformTransportError,
@@ -89,6 +117,7 @@ from supervisor.core import (
 
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = ROOT / "tools" / "bootstrap_project.mjs"
+APPLY_ENRICH = ROOT / "tools" / "apply_enrich.mjs"
 DEFAULT_CRITERION = "取得有效 flag 并 submit correct=true"
 # Explicit allowlist. Do not scan os.environ for http(s) values: BENCHMARK_BASE_URL
 # is opaque platform injection and may already be a *.tsecbench.gw host.
@@ -154,9 +183,10 @@ def profile_has_fgs(profile: str) -> bool:
 def fgs_after_sec() -> float | None:
     """Seconds from driver start before new workers use the FGS profile.
 
-    ``0`` selects the FGS profile immediately. A negative number, or
-    ``off`` / ``never`` / ``false`` / ``no``, keeps the baseline profile
-    for every new worker. The default is 7200.
+    Read only when ``CONTEST_FGS_MODE=after_sec``. ``on_fail`` (the default)
+    ignores this knob. ``0`` selects the FGS profile immediately. A negative
+    number, or ``off`` / ``never`` / ``false`` / ``no``, keeps the baseline
+    profile for every new worker. The default number is 7200.
     """
     raw = os.environ.get("CONTEST_FGS_AFTER_SEC", "7200").strip() or "7200"
     if raw.lower() in ("off", "never", "false", "no"):
@@ -179,25 +209,63 @@ def _fmt_after(value: float | None) -> str:
 
 
 def profile_for_now(*, elapsed: float | None = None, now: float | None = None) -> str:
-    """Profile for a worker that has not started yet.
+    """Wall-clock profile. Only ``CONTEST_FGS_MODE=after_sec`` honors the deadline.
 
-    Resolved on every call. Do not cache it at process start: after the
-    deadline, the next visit must see the FGS profile. This does not signal
-    any pid.
+    ``on_fail`` and ``off`` always return the baseline profile here. FGS is
+    chosen by ``profile_for_visit(pass_kind="fgs")``, not by elapsed time.
+    Resolved on every call. This does not signal any pid.
     """
     if elapsed is None:
         elapsed = driver_elapsed(now)
+    mode = fgs_mode()
+    if mode != "after_sec":
+        selected = baseline_profile_name()
+        after = "ignored" if mode == "on_fail" else "off"
+        log(
+            f"dsh profile select: elapsed={elapsed:.1f} FGS_AFTER={after} mode={mode} "
+            f"→ {selected} (FGS off)"
+        )
+        return selected
     after = fgs_after_sec()
     if after is None or elapsed < after:
         selected = baseline_profile_name()
     else:
         selected = fgs_profile_name()
-    mode = "FGS on" if profile_has_fgs(selected) else "FGS off"
+    flag = "FGS on" if profile_has_fgs(selected) else "FGS off"
     log(
         f"dsh profile select: elapsed={elapsed:.1f} FGS_AFTER={_fmt_after(after)} "
-        f"→ {selected} ({mode})"
+        f"→ {selected} ({flag})"
     )
     return selected
+
+
+def profile_for_visit(pass_kind: str, *, elapsed: float | None = None, now: float | None = None) -> str:
+    """Profile for one visit. ``first`` is baseline unless mode is ``after_sec``.
+
+    ``fgs`` selects the FGS profile only in ``on_fail`` (and in ``after_sec``
+    if the wall clock has already passed). ``off`` never selects it.
+    """
+    kind = "fgs" if str(pass_kind or "").strip().lower() == "fgs" else "first"
+    mode = fgs_mode()
+    if kind == "first" and mode != "after_sec":
+        if elapsed is None:
+            elapsed = driver_elapsed(now)
+        selected = baseline_profile_name()
+        after = "ignored" if mode == "on_fail" else "off"
+        log(
+            f"dsh profile select: pass=first elapsed={elapsed:.1f} FGS_AFTER={after} "
+            f"mode={mode} → {selected} (FGS off)"
+        )
+        return selected
+    if kind == "fgs" and mode == "on_fail":
+        selected = fgs_profile_name()
+        log(f"dsh profile select: pass=fgs mode=on_fail → {selected} (FGS on)")
+        return selected
+    if kind == "fgs" and mode == "off":
+        selected = baseline_profile_name()
+        log(f"dsh profile select: pass=fgs mode=off → {selected} (FGS off)")
+        return selected
+    return profile_for_now(elapsed=elapsed, now=now)
 
 
 def should_seed_fgs(profile: str) -> bool:
@@ -658,6 +726,40 @@ def bootstrap(
         raise DriverError(f"bootstrap returned non-JSON: {proc.stdout!r}") from exc
 
 
+def apply_enrich(cwd: Path, problem_id: str, payload: dict) -> dict:
+    """Write baseline facts onto an already seeded graph. Empty payload is a no-op."""
+    if payload.get("empty"):
+        return {"ok": True, "status": "empty", "facts": 0}
+    if not APPLY_ENRICH.is_file():
+        raise DriverError(f"missing enrich writer: {APPLY_ENRICH}")
+    blob = cwd / ".fgs" / "enrich-input.json"
+    blob.parent.mkdir(parents=True, exist_ok=True)
+    blob.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    proc = subprocess.run(
+        ["node", str(APPLY_ENRICH), "--cwd", str(cwd), "--problem-id", problem_id, "--payload", str(blob)],
+        cwd=str(ROOT),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.stderr.strip():
+        log(proc.stderr.strip())
+    if proc.returncode != 0:
+        raise DriverError(proc.stderr.strip() or proc.stdout.strip() or "enrich failed")
+    try:
+        return json.loads(proc.stdout.strip().splitlines()[-1])
+    except (json.JSONDecodeError, IndexError) as exc:
+        raise DriverError(f"enrich returned non-JSON: {proc.stdout!r}") from exc
+
+
+def reusable_container(challenge: dict) -> list[str]:
+    """Active container with an address. Second pass prefers this over start."""
+    status = str(challenge.get("container_status") or "").strip().lower()
+    if status not in ("available", "pending", "stop_pending"):
+        return []
+    return container_addrs(challenge)
+
+
 def assert_seeded(cwd: Path, problem_id: str) -> None:
     competition = cwd / ".fgs" / "competition.json"
     graph = cwd / ".fgs" / "projects" / problem_id / "graph.yaml"
@@ -711,6 +813,7 @@ def launch_dsh(
     challenge: dict | None = None,
     addrs: list[str] | None = None,
     api_prefix: str | None = None,
+    pass_kind: str = "first",
 ):
     """Start the solver in ``cwd``.
 
@@ -756,6 +859,7 @@ def launch_dsh(
         "protocol": "anthropic_messages",
         "profile": chosen,
         "fgs": profile_has_fgs(chosen),
+        "pass": "fgs" if str(pass_kind).strip().lower() == "fgs" else "first",
         "uniqueCode": code,
         "note": (
             "Harness is not launched unless CONTEST_DSH_LAUNCH=1 and dsh is on PATH "
@@ -783,6 +887,17 @@ def launch_dsh(
     return None
 
 
+def _record_pass(cwd: Path, pass_kind: str, profile: str) -> None:
+    path = cwd / ".contest" / "passes.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(
+        {"pass": pass_kind, "profile": profile, "fgs": profile_has_fgs(profile)},
+        ensure_ascii=False,
+    )
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line + "\n")
+
+
 def visit(
     challenge: dict,
     *,
@@ -792,15 +907,30 @@ def visit(
     workdir: Path,
     fixture: bool,
     background: bool = False,
+    pass_kind: str = "first",
+    enrich_dir: str | None = None,
+    fail_reason: str = "",
+    reuse_ok: bool = True,
 ) -> dict:
     raw_code = str(challenge.get("unique_code") or challenge.get("code") or "").strip()
     problem_id = normalize_problem_id(raw_code)
     if not problem_id or not re.fullmatch(r"[a-z0-9_-]{1,64}", problem_id):
         return {"ok": False, "problemId": raw_code, "code": raw_code, "error": f"bad problem id: {raw_code!r}"}
+    kind = "fgs" if str(pass_kind or "").strip().lower() == "fgs" else "first"
     started = False
     try:
+        reused = False
         if fixture:
             addrs = container_addrs(challenge)
+        elif kind == "fgs" and reuse_ok:
+            addrs = reusable_container(challenge)
+            if addrs:
+                reused = True
+                log(f"reuse container {problem_id or raw_code}")
+            else:
+                addrs = start_challenge_live(base, prefix or "", token, raw_code)
+                started = True
+                log(f"restart container {problem_id or raw_code}")
         else:
             addrs = start_challenge_live(base, prefix or "", token, raw_code)
             started = True
@@ -808,9 +938,10 @@ def visit(
             raise DriverError("start returned empty container_addr; skip bootstrap and dsh")
         cwd = workdir / problem_id
         cwd.mkdir(parents=True, exist_ok=True)
-        profile = profile_for_now()
+        profile = profile_for_visit(kind)
         status = "skipped-seed"
         launched_id = problem_id
+        enrich_note = "skip"
         if should_seed_fgs(profile):
             brief = compose_brief(str(challenge.get("description") or ""), addrs)
             target = ", ".join(addrs)
@@ -818,6 +949,27 @@ def visit(
             assert_seeded(cwd, seeded.get("problemId") or problem_id)
             status = seeded.get("status") or "seeded"
             launched_id = seeded.get("problemId") or problem_id
+            if kind == "fgs":
+                payload = collect_enrich(enrich_dir, reason=fail_reason)
+                enrich_path = cwd / ".fgs" / "enrich-input.json"
+                enrich_path.parent.mkdir(parents=True, exist_ok=True)
+                enrich_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                if payload.get("empty"):
+                    enrich_note = "empty"
+                    log(f"enrich=empty code={raw_code}")
+                else:
+                    try:
+                        applied = apply_enrich(cwd, launched_id, payload)
+                    except DriverError as exc:
+                        enrich_note = "error"
+                        log(f"enrich failed code={raw_code}: {exc}")
+                    else:
+                        count = int(applied.get("facts") or 0)
+                        enrich_note = "empty" if applied.get("status") == "empty" or count == 0 else f"facts:{count}"
+                        log(f"enrich={enrich_note} code={raw_code}")
         proc = launch_dsh(
             cwd,
             launched_id,
@@ -827,8 +979,14 @@ def visit(
             challenge=challenge,
             addrs=addrs,
             api_prefix=prefix,
+            pass_kind=kind,
         )
-        log(f"visit {problem_id} {status}")
+        _record_pass(cwd, kind, profile)
+        if kind == "fgs":
+            log(f"visit {problem_id} {status} pass=fgs enrich={enrich_note}")
+        else:
+            log(f"visit {problem_id} {status} pass=first")
+        fields = challenge_fields(challenge, addrs, raw_code, target=display_target(addrs))
         result = {
             "ok": True,
             "problemId": problem_id,
@@ -836,8 +994,12 @@ def visit(
             "status": status,
             "profile": profile,
             "fgs": profile_has_fgs(profile),
+            "pass": kind,
+            "enrich": enrich_note,
             "cwd": str(cwd),
             "started": started,
+            "reused": reused,
+            "budget_min": fields.get("budget_min") or "",
         }
         if proc is not None:
             result["pid"] = proc.pid
@@ -971,6 +1133,10 @@ def remember_slot(result: dict) -> dict | None:
         "dir": result.get("cwd"),
         "launched": bool(result.get("launched")),
         "session_id": "",
+        "pass_kind": result.get("pass") or "first",
+        "profile": result.get("profile") or "",
+        "started_at": stamp_utc(),
+        "budget_min": result.get("budget_min") or "",
     }
 
 
@@ -1049,6 +1215,152 @@ def run_supervised(workdir: Path, token: str, base: str, fixture_path: str) -> i
         release_lock(run)
 
 
+def _code_completed(challenges, code: str) -> bool:
+    for item in challenges or []:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("unique_code") or item.get("code") or "").strip() != code:
+            continue
+        return is_completed(item)
+    return False
+
+
+def _enqueue_fail(run: Path, code: str, reason: str, directory: str | None) -> None:
+    try:
+        dest = run / "queue" / "artifacts" / safe_code(code)
+        artifact = snapshot_artifacts(Path(directory) if directory else None, dest)
+    except (SupervisorError, OSError) as exc:
+        log(f"snapshot {code} failed: {exc}")
+        artifact = ""
+    try:
+        register_fail(
+            run,
+            unique_code=code,
+            reason=reason,
+            artifact_dir=artifact,
+            attempt=1,
+            problem_id="",
+        )
+        mark_first_pass_done(run, code)
+    except SupervisorError as exc:
+        log(f"register_fail {code} failed: {exc}")
+        return
+    log(f"fail {code} reason={reason}")
+
+
+def _mark_done(run: Path, code: str) -> None:
+    try:
+        mark_first_pass_done(run, code)
+    except SupervisorError as exc:
+        log(f"mark first pass {code} failed: {exc}")
+
+
+def _settle_fgs_end(run: Path, code: str) -> None:
+    _mark_done(run, code)
+    try:
+        if not fgs_done(run, code):
+            bump_failed_at(run, code)
+    except SupervisorError as exc:
+        log(f"fgs settle {code} failed: {exc}")
+
+
+def _classify_dead_slot(run: Path, slot: dict, challenges, *, transport_glitch: bool) -> None:
+    """Record a finished worker. A list glitch parks it instead of enqueueing."""
+    code = str(slot.get("code") or "").strip()
+    if not code:
+        return
+    view = slot_view(slot)
+    if view["alive"]:
+        return
+    pass_kind = slot.get("pass_kind") or "first"
+    if pass_kind == "fgs":
+        _settle_fgs_end(run, code)
+        return
+    if not view["launched"]:
+        _mark_done(run, code)
+        return
+    if transport_glitch:
+        try:
+            park_unclassified(run, code, {
+                "unique_code": code,
+                "dir": slot.get("dir") or "",
+                "pass_kind": pass_kind,
+                "reason": "reap",
+            })
+        except SupervisorError as exc:
+            log(f"park {code} failed: {exc}")
+        return
+    reason = failure_reason(
+        completed=_code_completed(challenges, code),
+        alive=False,
+        launched=True,
+        meta_state=view.get("meta_state"),
+        deferred_past_grace=False,
+        budget_past=False,
+        fail_on_budget=False,
+        transport_glitch=False,
+    )
+    if reason:
+        _enqueue_fail(run, code, reason, slot.get("dir"))
+    else:
+        _mark_done(run, code)
+
+
+def _drain_unclassified(run: Path, challenges) -> None:
+    for info in list_unclassified(run):
+        code = str(info.get("unique_code") or "").strip()
+        if not code:
+            continue
+        matched = None
+        for item in challenges or []:
+            if isinstance(item, dict) and str(item.get("unique_code") or item.get("code") or "").strip() == code:
+                matched = item
+                break
+        if matched is None:
+            continue
+        try:
+            discard_unclassified(run, code)
+        except SupervisorError as exc:
+            log(f"discard parked {code} failed: {exc}")
+            continue
+        if is_completed(matched) or info.get("pass_kind") == "fgs":
+            _mark_done(run, code)
+            if info.get("pass_kind") == "fgs":
+                _settle_fgs_end(run, code)
+            continue
+        _enqueue_fail(run, code, str(info.get("reason") or "reap"), info.get("dir") or "")
+
+
+def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *, list_failed: bool) -> None:
+    code = str(action.get("code") or "").strip()
+    if not code:
+        return
+    state = str(action.get("state") or "")
+    pass_kind = (slot or {}).get("pass_kind") or "first"
+    directory = action.get("dir") or (slot or {}).get("dir") or ""
+    if state == "solved" or _code_completed(challenges, code):
+        _mark_done(run, code)
+        return
+    if pass_kind == "fgs":
+        _settle_fgs_end(run, code)
+        return
+    if state not in ("deferred", "budget"):
+        _mark_done(run, code)
+        return
+    if list_failed:
+        try:
+            park_unclassified(run, code, {
+                "unique_code": code,
+                "dir": directory,
+                "pass_kind": pass_kind,
+                "reason": state,
+            })
+        except SupervisorError as exc:
+            log(f"park {code} failed: {exc}")
+        return
+    _enqueue_fail(run, code, state, directory)
+
+
 def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_path: str) -> int:
     # A bad CONTEST_HTTP_TIMEOUT is configuration, not a platform blip.
     http_timeout(30)
@@ -1056,12 +1368,15 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
     grace, grace_solved = grace_settings()
     cap = concurrency()
     attempted: set[str] = set()
+    blocked: set[str] = set()
+    closed_this_tick: set[str] = set()
     slots: list[dict] = []
     visits: list[dict] = []
     closed = load_closed_set(run)
     pending_close: set[str] = set()
     prefix = None
     announced = False
+    use_fail_queue = fgs_mode() == "on_fail"
 
     def attempt_close(code: str) -> bool:
         if not code or code in closed:
@@ -1072,9 +1387,13 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             pending_close.add(code)
             return False
         pending_close.discard(code)
-        return outcome == "closed"
+        if outcome == "closed":
+            closed_this_tick.add(code)
+            return True
+        return False
 
     while True:
+        closed_this_tick.clear()
         list_failed = False
         try:
             prefix, challenges, listed = load_challenge_snapshot(base, token, fixture_path)
@@ -1107,10 +1426,37 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             if code in touched or code in closed:
                 continue
             attempt_close(code)
+        if use_fail_queue:
+            if list_failed:
+                for slot in slots:
+                    if not slot_view(slot)["alive"]:
+                        _classify_dead_slot(run, slot, challenges, transport_glitch=True)
+            else:
+                _drain_unclassified(run, challenges)
+                for slot in slots:
+                    if not slot_view(slot)["alive"]:
+                        _classify_dead_slot(run, slot, challenges, transport_glitch=False)
         slots = [slot for slot in slots if slot_view(slot)["alive"]]
 
         views = [slot_view(slot) for slot in slots]
-        for action in plan_retire(views, challenges, now=utc_now(), grace=grace, grace_solved=grace_solved):
+        retire_actions = plan_retire(views, challenges, now=utc_now(), grace=grace, grace_solved=grace_solved)
+        if use_fail_queue:
+            seen_codes = {action["code"] for action in retire_actions}
+            budget_views = []
+            for slot in slots:
+                view = slot_view(slot)
+                view["started_at"] = slot.get("started_at")
+                view["budget_min"] = slot.get("budget_min")
+                budget_views.append(view)
+            for action in plan_budget_retire(
+                budget_views,
+                challenges,
+                now=utc_now(),
+                enabled=fail_on_budget(),
+            ):
+                if action["code"] not in seen_codes:
+                    retire_actions.append(action)
+        for action in retire_actions:
             if action["op"] == "hold":
                 append_log(
                     run,
@@ -1124,7 +1470,11 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             if action.get("archive") and action.get("dir"):
                 archive_worker(Path(action["dir"]))
             mark_retired(run, action["code"])
-            attempted.add(action["code"])
+            slot = next((item for item in slots if item.get("code") == action["code"]), None)
+            if use_fail_queue:
+                _note_retire_fail(run, action, slot, challenges, list_failed=list_failed)
+            else:
+                attempted.add(action["code"])
             append_log(run, f"retire {action['code']} ({action['state']})", tag="retire")
             log(f"retire {action['code']}")
         slots = [slot for slot in slots if slot_view(slot)["alive"]]
@@ -1135,39 +1485,106 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             terminate_pid(sampler.get("pid"), wait=0.2)
             append_log(run, f"gc sampler pid={sampler.get('pid')} (session={sampler.get('session_id')})")
 
-        inflight = {slot.get("code") for slot in slots}
-        queue = pending_queue(challenges, attempted, inflight)
+        inflight = {slot.get("code") for slot in slots if slot.get("code")}
         alive = sum(1 for slot in slots if slot_view(slot)["alive"])
         # Unknown list fails closed: do not start another container on a guess.
         active = count_active(challenges, unknown=list_failed)
-        budget = dispatch_budget(alive, active, cap, len(queue))
-        append_log(run, f"alive_workers={alive} active_containers={active} queue_left={len(queue)}")
-        log(f"supervisor tick alive={alive} active={active} queue={len(queue)} budget={budget}")
+        plans: list[dict] = []
+        if use_fail_queue:
+            retries = fgs_max_retries()
+            if list_failed:
+                new_n = 0
+                fgs_n = 0
+            else:
+                new_n = len(queue_new(challenges, run=run, inflight=inflight, blocked=blocked))
+                fgs_n = len(queue_fgs(
+                    challenges,
+                    run=run,
+                    inflight=inflight,
+                    blocked=blocked,
+                    max_retries=retries,
+                ))
+            fgs_live = sum(
+                1 for slot in slots if slot.get("pass_kind") == "fgs" and slot_view(slot)["alive"]
+            )
+            plans = select_dispatch(
+                challenges,
+                run=run,
+                inflight=inflight,
+                blocked=blocked,
+                fgs_inflight=fgs_live,
+                alive=alive,
+                active=active,
+                cap=cap,
+                retry_last=fgs_retry_last(),
+                fgs_max_active=fgs_max_active(),
+                max_retries=retries,
+                list_failed=list_failed,
+            )
+            queue_len = new_n + fgs_n
+            budget = len(plans)
+            tick_extra = f" queue_new={new_n} queue_fgs={fgs_n}"
+        else:
+            queue = pending_queue(challenges, attempted, inflight)
+            queue_len = len(queue)
+            budget = dispatch_budget(alive, active, cap, queue_len)
+            if budget > 0:
+                for item in queue[:budget]:
+                    code = str(item.get("unique_code") or item.get("code") or "").strip()
+                    plans.append({
+                        "challenge": item,
+                        "pass_kind": "first",
+                        "code": code,
+                        "record": None,
+                    })
+            new_n = queue_len
+            fgs_n = 0
+            retries = 0
+            tick_extra = ""
+        append_log(run, f"alive_workers={alive} active_containers={active} queue_left={queue_len}")
+        log(f"supervisor tick alive={alive} active={active} queue={queue_len} budget={budget}{tick_extra}")
 
-        if budget > 0 and queue:
-            batch = queue[:budget]
-            for item in batch:
-                code = str(item.get("unique_code") or item.get("code") or "").strip()
-                if code:
+        if plans:
+            for plan in plans:
+                code = plan.get("code") or ""
+                if not code:
+                    continue
+                if use_fail_queue and plan["pass_kind"] == "fgs":
+                    try:
+                        note_fgs_dispatch(run, code, retries)
+                    except SupervisorError as exc:
+                        log(f"note fgs dispatch {code} failed: {exc}")
+                elif use_fail_queue:
+                    try:
+                        mark_first_pass_started(run, code)
+                    except SupervisorError as exc:
+                        log(f"mark first pass started {code} failed: {exc}")
+                else:
                     attempted.add(code)
-            with ThreadPoolExecutor(max_workers=max(1, min(len(batch), cap))) as pool:
-                futures = [
-                    pool.submit(
+            with ThreadPoolExecutor(max_workers=max(1, min(len(plans), cap))) as pool:
+                futures = []
+                for plan in plans:
+                    record = plan.get("record") or {}
+                    futures.append(pool.submit(
                         visit,
-                        item,
+                        plan["challenge"],
                         base=base,
                         prefix=prefix,
                         token=token,
                         workdir=workdir,
                         fixture=bool(fixture_path),
                         background=True,
-                    )
-                    for item in batch
-                ]
+                        pass_kind=plan["pass_kind"],
+                        enrich_dir=record.get("artifact_dir") or None,
+                        fail_reason=str(record.get("reason") or ""),
+                        reuse_ok=plan.get("code") not in closed_this_tick,
+                    ))
                 for future in as_completed(futures):
                     result = future.result()
                     visits.append(result)
                     if not result.get("ok"):
+                        if result.get("code"):
+                            blocked.add(result["code"])
                         if result.get("close") and result.get("code"):
                             attempt_close(result["code"])
                         continue
@@ -1183,7 +1600,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
         # still occupies a platform slot, so keep ticking until it succeeds.
         if (
             not list_failed
-            and not queue
+            and queue_len == 0
             and not pending_close
             and not any(slot_view(slot)["alive"] for slot in slots)
         ):

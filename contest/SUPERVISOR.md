@@ -15,11 +15,24 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 1. **reap** — 容器仍是 `available` / `pending` / `stop_pending`，或本进程启动过的 worker 已经退出，且没有存活 pid → `close` 一次。有存活 pid → 留下。
 2. **retire** — 存活 worker 的 meta 是 `deferred` 或 `solved`，或平台 `is_completed`。过宽限后 `SIGTERM`，仍在则 `SIGKILL`，然后 `close`。平台已通关但 meta 还不是 `solved` 用短宽限（默认 30 秒），其余默认 60 秒。`solved`（含平台对账）会把 worker 目录归档为 `_done_*`。
 3. **gc** — `monitor_sampler.sh loop` 的 `SESSION_ID` 不属于存活 worker 时杀掉。
-4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才从本 driver 的未完成队列启动下一题。任一护栏顶满都不派。列表失败时按活跃容器已满处理，不补派。
+4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才补人。默认 `CONTEST_FGS_MODE=on_fail` 时先派未做过一遍的新题（profile `contest-baseline`，不预种）。新题没有了，才按 `failed_at` 从早到晚派失败题的二遍（profile `contest`，预种并补图），同时活着的 FGS worker 不超过 `CONTEST_FGS_MAX_ACTIVE`。`CONTEST_FGS_RETRY_LAST=1` 时，只要还有新题，这一轮就不派 FGS。列表失败时按活跃容器已满处理，不补派，也不把题写进失败队列。
 
-平台 list / start / close 的 HTTP 超时或连接中断只打 `contest:` 日志，driver 继续下一轮。close 没拿到响应时不写入已关集合，下一轮再试。close 超时不是失分（已经 submit 的分数还在）；这个异常如果冒出主循环，整条 launch/submit 流水线会停。
+平台 list / start / close 的 HTTP 超时或连接中断只打 `contest:` 日志，driver 继续下一轮。close 没拿到响应时不写入已关集合，下一轮再试。这类毛刺 **不是** 失败，不会入 FGS 队。close 超时不是失分（已经 submit 的分数还在）；这个异常如果冒出主循环，整条 launch/submit 流水线会停。
 
-队列空、没有待重试的 close、且没有存活 worker 时 driver 退出。列表失败不算队列空。`CONTEST_SUPERVISOR=0` 不进入循环，仍是一次性 list → start → 预种 → dsh。
+### 失败（窄）
+
+同时满足才写入 `$RUN/queue/failed/<code>.json`：
+
+1. 平台 `is_completed` / `completed` 不是真，本地 meta 也不是 `solved`。
+2. 并且是下面之一：worker 进程已经死掉（reap）；或 meta `deferred` 且过了 `CONTEST_RETIRE_GRACE` 被 retire；或显式打开 `CONTEST_FAIL_ON_BUDGET=1` 后，活着的 worker 超过本题预算仍未通关被 retire。
+
+还在跑、多 flag 没齐、close/list 超时，都不是失败。通关走 solved 归档，禁止再 FGS。
+
+一遍结束记在 `queue/first_pass_done/<code>`，不再表示「永远不派」。二遍派过并达到 `CONTEST_FGS_MAX_RETRIES` 后记 `queue/fgs_done/<code>`。baseline 产物快照在 `queue/artifacts/<code>/`。补图从这里抽 Fact（做过什么、已验证、已排除，不写裸 flag）和一条继续利用的 Intent。产物为空则只种 origin/goal，日志 `enrich=empty`。
+
+二遍若该题容器仍是 `available` / `pending` / `stop_pending` 且 `container_addr` 还在，就复用，不再 `start`。reap 已经把容器 close 掉时，二遍会再 `start`。
+
+队列空、没有待重试的 close、且没有存活 worker 时 driver 退出。列表失败不算队列空。`CONTEST_SUPERVISOR=0` 不进入循环，仍是一次性 list → start →（按当前 mode 的一遍 profile）→ dsh，没有失败重试。
 
 `contest/supervisor/autosup.sh` 是 `$RUN/workers/wN_<code>` 那套目录布局的手动入口，内部同样是 gc → retire → reap → 双护栏。它和 driver **不能同时补派**：谁先拿到 `$RUN/monitor/scheduler.lock`，另一方直接退出。entrypoint 不会启动 `autosup.sh`。
 
@@ -36,9 +49,14 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_SUPERVISOR_INTERVAL` | `20` |
 | `CONTEST_HTTP_TIMEOUT` | 不设时 close 为 20、driver 的 list/start 为 30。设置后三者共用，且必须是正数 |
 | `FGS_UNIQUE_CODE` | driver 按题注入 | 与 start/close 的 `unique_code` 相同。不要在上传页设成一个全局值。缺了则 FGS `submit_flag.mjs` fail-closed。baseline 的 `benchmark_submit_flag` 同样只认这个子进程值和本题 meta，不认 `BENCHMARK_UNIQUE_CODE` |
-| `CONTEST_DSH_PROFILE` | `contest-baseline` | 未到 `CONTEST_FGS_AFTER_SEC` 时新 worker 的 profile。无 FGS bundle |
-| `CONTEST_DSH_PROFILE_FGS` | `contest` | 到点之后**新** worker 的 profile。含 FGS。不改已经在跑的 worker |
-| `CONTEST_FGS_AFTER_SEC` | `7200` | 从 driver 进程启动起算的秒数。`0` 立刻全用 FGS profile。负数或 `off` / `never` / `false` / `no` 则一直用 baseline。不热挂载，也不为切换杀进程 |
+| `CONTEST_DSH_PROFILE` | `contest-baseline` | 新题一遍的 profile。无 FGS bundle |
+| `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 profile。含 FGS。不改已经在跑的 worker |
+| `CONTEST_FGS_MODE` | `on_fail` | `on_fail` 推荐。`after_sec` 保留 PR#12 墙钟且不重试失败题。`off` 永不 FGS |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | **只在 `mode=after_sec` 时生效。** `on_fail` 忽略。`0` 立刻全用 FGS profile。负数或 `off` / `never` / `false` / `no` 则一直用 baseline。不热挂载，也不为切换杀进程 |
+| `CONTEST_FGS_RETRY_LAST` | `1` | `1`：有新题就不跑 FGS。`0`：可以和新题同一轮并行，仍受下面的上限 |
+| `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
+| `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数。用尽后写 `fgs_done` |
+| `CONTEST_FAIL_ON_BUDGET` | 关 | `1` 才把「活过预算仍未通关」当失败。默认关 |
 | `CONTEST_SKIP_FGS_SEED` | `auto` | `auto`：只有 FGS profile 预种图。`1` 一律不预种。`0` 一律预种 |
 | `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书里的「本题时间预算」分钟数。平台字段优先 |
 
@@ -60,7 +78,10 @@ CONTEST_SUPERVISOR_INTERVAL=20
 CONTEST_DSH_LAUNCH=1
 CONTEST_DSH_PROFILE=contest-baseline
 CONTEST_DSH_PROFILE_FGS=contest
-CONTEST_FGS_AFTER_SEC=7200
+CONTEST_FGS_MODE=on_fail
+CONTEST_FGS_RETRY_LAST=1
+CONTEST_FGS_MAX_ACTIVE=1
+CONTEST_FGS_MAX_RETRIES=1
 SOLVER_GATEWAY=1
 DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 # + BENCHMARK_TOKEN / BENCHMARK_BASE_URL / DEEPSEEK_API_KEY（运行时注入，勿进镜像）

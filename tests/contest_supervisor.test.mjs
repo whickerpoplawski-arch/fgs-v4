@@ -45,6 +45,12 @@ function baseEnv(extra = {}) {
     'CONTEST_RETIRE_GRACE_SOLVED',
     'CONTEST_MAX_ACTIVE',
     'CONTEST_MAX_CONCURRENCY',
+    'CONTEST_FGS_MODE',
+    'CONTEST_FGS_AFTER_SEC',
+    'CONTEST_FGS_RETRY_LAST',
+    'CONTEST_FGS_MAX_ACTIVE',
+    'CONTEST_FGS_MAX_RETRIES',
+    'CONTEST_FAIL_ON_BUDGET',
     'GRACE',
     'GRACE_SOLVED',
   ]) {
@@ -602,10 +608,12 @@ test('driver 循环：worker 进程退出后 close 一次；deferred 超宽限�
     CONTEST_SUPERVISOR: '1',
     CONTEST_WORKER_CMD: 'true',
     CONTEST_SUPERVISOR_INTERVAL: '0',
+    CONTEST_FGS_MODE: 'after_sec',
   }));
   assert.equal(dead.status, 0, dead.stderr);
   const notes = closeNotes(path.join(scratch, 'dead-run'));
   assert.equal(notes.filter((item) => item.code === 'gone-1').length, 1);
+  assert.equal(fs.existsSync(path.join(scratch, 'dead-run', 'queue', 'failed')), false);
   const prompt = fs.readFileSync(path.join(deadWork, 'gone-1', 'prompt.txt'), 'utf8');
   assert.match(prompt, /自主渗透 Solver/);
   assert.match(prompt, /benchmark_get_progress/);
@@ -637,6 +645,7 @@ exec sleep 120
     CONTEST_SUPERVISOR_INTERVAL: '0',
     CONTEST_SUPERVISOR_NOW: '2026-01-01T00:00:00Z',
     CONTEST_RETIRE_GRACE: '180',
+    CONTEST_FGS_MODE: 'after_sec',
   }));
   assert.equal(live.status, 0, `${live.stderr}\n${live.stdout}`);
   assert.match(live.stderr, /retire slow-1/);
@@ -711,6 +720,7 @@ test('G1：concludeTurn 被忽略时活 sleep 子进程过默认宽限仍被 dri
     CONTEST_WORKER_CMD: liveScript,
     CONTEST_SUPERVISOR_INTERVAL: '0',
     CONTEST_SUPERVISOR_NOW: '2026-01-01T00:00:00Z',
+    CONTEST_FGS_MODE: 'after_sec',
   }));
   assert.equal(retired.status, 0, `${retired.stderr}\n${retired.stdout}`);
   assert.match(retired.stderr, /retire g1-live/);

@@ -341,6 +341,7 @@ try:
     except driver.DriverError as exc:
         path_only = str(exc)
     workdir = Path(tempfile.mkdtemp())
+    os.environ["CONTEST_FGS_MODE"] = "after_sec"
     os.environ["CONTEST_FGS_AFTER_SEC"] = "0"
     visited = driver.visit(
         {"unique_code": "e1-02", "description": "demo", "is_completed": False},
@@ -519,6 +520,7 @@ test('fixture 队列预种后图存在，第二次 driver 不改 graph.yaml', ()
     SOLVER_GATEWAY: '1',
     OPENAI_BASE_URL: 'https://api.deepseek.com/v1',
     CONTEST_MAX_CONCURRENCY: '3',
+    CONTEST_FGS_MODE: 'after_sec',
     CONTEST_FGS_AFTER_SEC: '0',
   };
   const first = runPython([driver], env);
