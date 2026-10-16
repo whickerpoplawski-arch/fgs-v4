@@ -4,7 +4,8 @@
 # The platform does not mandate ENTRYPOINT syntax. It does require the image
 # to start solving by itself after the container launches. This script is that
 # start: validate the injected env, then exec the driver. The driver lists
-# challenges, starts each one, disk-seeds FGS, and only then launches dsh.
+# challenges, starts each one, writes the Solver brief, and launches dsh.
+# FGS disk seed runs only for workers on the FGS profile.
 #
 # CONTEST_SUPERVISOR defaults on. Reap / retire / the dual-guard refill run
 # inside the driver so there is one scheduler. This script does not start
@@ -32,7 +33,7 @@ fi
 # SOLVER_GATEWAY=1: the driver rewrites model base URLs only
 #   (DEEPSEEK_BASE_URL, OPENAI_BASE_URL, and baseURL inside $DSH_HOME/profiles
 #   or $CONTEST_DSH_PROFILE_DIR):
-#   https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1
+#   https://api.deepseek.com/anthropic → http://api.deepseek.com.tsecbench.gw/anthropic
 # This script does not rewrite env or profiles. BENCHMARK_BASE_URL,
 # BENCHMARK_TOKEN, and Challenges API URLs stay as the platform injected them.
 # Hosted sandboxes have no public internet. Leave the flag unset for local runs.

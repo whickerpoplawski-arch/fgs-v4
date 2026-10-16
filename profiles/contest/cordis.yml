@@ -1,0 +1,3 @@
+# contest profile marker (FGS on, same Messages route as contest-baseline).
+# Effective rows are bundle patches plus cordis.patch.yml.
+# This file has no entries. Do not declare providers here.

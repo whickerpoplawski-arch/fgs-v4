@@ -1,0 +1,5 @@
+# One-hop Challenges tools for contest-baseline and contest.
+# Names are the Solver brief literals. This bundle does not load FGS.
+- insert:
+    - id: contest-benchmark-tools
+      name: '@local/contest-benchmark-tools'

@@ -1,0 +1,16 @@
+{
+  "name": "@local/contest-benchmark-tools",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "TSecBench baseline tools: benchmark_get_progress, benchmark_submit_flag, record_observation.",
+  "exports": {
+    ".": "./index.js",
+    "./api": "./api.js"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

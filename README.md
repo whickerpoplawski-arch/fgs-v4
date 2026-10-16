@@ -2,12 +2,12 @@
 
 装插件、做自己的竞赛镜像，先核对这六条：
 
-1. **模型**：只用 `openai-completions`（`responses` 流式会丢 `function_call`）。provider id 不要用 `deepseek-official`，换成唯一 id，例如 `deepseek-contest`。
+1. **模型**：竞赛 profile 走官方 **Messages**（`deepseek-official` + `https://api.deepseek.com/anthropic`，会话协议 `anthropic_messages`）。**不要**把 `deepseek-official` patch 成 `openai-completions`：该 id 已经是内置 Messages，再声明会被丢掉（`already declared`），请求仍打 Messages，配上 chat `/v1` 根路径就是 **HTTP 404**。若还要 completions，用另一个 id（`deepseek-contest`），不要复用 `deepseek-official`。
 2. **托管上传环境变量**：只填 `DEEPSEEK_API_KEY` 和 `SOLVER_GATEWAY=1`。不要设 `BENCHMARK_*`（平台运行时注入）。
 3. **镜像要能跑 bash**：安装 `bubblewrap`（`bwrap`），和/或把 DSH 默认权限设成 `danger-full-access`，`approval.policy` 设为 `never`。
 4. **打靶**：用 `bash` / `curl` 打挑战目标。`web_fetch` 会拒私网 IP（`10.0.177.x`）。
 5. **开题**：`POST .../challenges/start?unique_code=`（`unique_code` 放在 query）。`5624fa3` 已经是这个写法。
-6. **交 flag（SCORE）**：竞赛 `cordis.patch.yml` 必须是 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 `POST /openapi/v1/challenges/submit`，本地可以多次显示「goal_final 已满足」，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
+6. **交 flag（SCORE）**：baseline（`contest-baseline`）用 `benchmark_submit_flag` 一跳 `POST …/challenges/submit`，不经过 `fgs_satisfy_goal`。FGS profile（到点后的新 worker）仍把插件 `cordis.patch.yml` 保持 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`；同一 profile 也挂了 `benchmark_*`，Decide 放行这三个工具。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 POST submit，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
 
 ---
 
@@ -91,15 +91,15 @@ Installing this plugin into a profile bundle only provides the **FGS tools and t
 
 TSecBench 托管容器在插件之外还要：
 
-- **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` → 磁盘预种 → `dsh`。预种在任何模型回合之前完成，不要等模型敲 `/fgs new` 或调用 `fgs_project`。
-- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`。
-- **不要设置** `BENCHMARK_*`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入；不要写进镜像，也不要填在上传页。
-- **交 flag** 走插件 §8，不另开旁路。竞赛镜像保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`；不要把 `regex` 打进竞赛镜像。
-- 竞赛 profile 用 **openai-completions**（responses 流式会丢 `function_call`）。模型 base URL 用网关白名单上的 LLM 基址，例如 `https://api.deepseek.com/v1`。`SOLVER_GATEWAY=1` 只改写 `DEEPSEEK_BASE_URL` / `OPENAI_BASE_URL` 等和 profile 的 `baseURL`（`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`），不改 `BENCHMARK_*` 和 Challenges API。
+- **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` →（仅 FGS profile）磁盘预种 → Solver 任务书 → `dsh --profile <contest-baseline|contest>`。baseline 不预种。FGS 预种在任何模型回合之前完成。
+- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`。前 `CONTEST_FGS_AFTER_SEC` 秒（默认 7200）新 worker 用 `contest-baseline`；之后新 worker 用 `contest`。不热挂载，不为切换杀正在跑的 worker。
+- **不要设置** `BENCHMARK_*`，也不要在上传页写全局 `FGS_UNIQUE_CODE`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入。
+- **交 flag**：baseline 走 `benchmark_submit_flag`（同一 POST submit）。FGS 插件仍保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`。
+- 竞赛 profile 用 **stock Messages**：`provider: deepseek-official`，`baseURL: https://api.deepseek.com/anthropic`。`SOLVER_GATEWAY=1` 只改写模型基址（`https://api.deepseek.com/anthropic` → `http://api.deepseek.com.tsecbench.gw/anthropic`），不改 `BENCHMARK_*` 和 Challenges API。不要把 `deepseek-official` 配成 `openai-completions`。
 
 没有 contest driver，或 `CONTEST_SUPERVISOR` 不是 `1`，**reap / retire 不会运行**。
 
-The hosted container also needs `ENTRYPOINT contest/entrypoint.sh` (driver: list → start → disk preseed → dsh), plus `CONTEST_SUPERVISOR=1`, `CONTEST_DSH_LAUNCH=1`, and `SOLVER_GATEWAY=1`. Do not set `BENCHMARK_*` (the platform injects them). Use openai-completions and an allowlisted model base URL such as `https://api.deepseek.com/v1`. Without the contest driver and `CONTEST_SUPERVISOR=1`, reap / retire do not run.
+The hosted container also needs `ENTRYPOINT contest/entrypoint.sh` (driver: list → start → Solver brief → dsh; FGS preseed only on the FGS profile), plus `CONTEST_SUPERVISOR=1`, `CONTEST_DSH_LAUNCH=1`, and `SOLVER_GATEWAY=1`. Do not set `BENCHMARK_*` (the platform injects them). Use stock DeepSeek Messages (`deepseek-official`, base `https://api.deepseek.com/anthropic`). Do not patch that provider id to openai-completions. Without the contest driver and `CONTEST_SUPERVISOR=1`, reap / retire do not run.
 
 细则：[`contest/SUPERVISOR.md`](contest/SUPERVISOR.md)，启动顺序见 [TSecBench contest entry](#tsecbench-contest-entry)。
 
@@ -284,12 +284,17 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `BENCHMARK_TOKEN` | 平台注入 | 缺则 `contest/entrypoint.sh` **exit 1**。不要写进镜像，也不要填在上传页 |
 | `BENCHMARK_BASE_URL` | 平台注入 | 同上 |
 | 模型 key / base URL | 上传页环境 | 运行时读取。镜像内剥离密钥 |
-| `SOLVER_GATEWAY=1` | 选手运行时 | 只改写模型基址（`DEEPSEEK_BASE_URL`、`OPENAI_BASE_URL` 等）和竞赛 profile 的 `baseURL`：`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`（https→http，主机名后加 `.tsecbench.gw`）。不改 `BENCHMARK_BASE_URL`、`BENCHMARK_TOKEN`，也不改 Challenges API URL。托管沙箱没有公网。本地调试不要设 |
+| `SOLVER_GATEWAY=1` | 选手运行时 | 只改写模型基址（`DEEPSEEK_BASE_URL`、`OPENAI_BASE_URL` 等）和竞赛 profile 的 `baseURL`：`https://api.deepseek.com/anthropic` → `http://api.deepseek.com.tsecbench.gw/anthropic`（https→http，主机名后加 `.tsecbench.gw`）。不改 `BENCHMARK_BASE_URL`、`BENCHMARK_TOKEN`，也不改 Challenges API URL。托管沙箱没有公网。本地调试不要设。Messages 不要把这个值设成 chat `/v1` 根，否则会 404 |
 | `CONTEST_VPN` | 可选，默认关 | integration 文档写访问题址要任务 VPN；托管上传页**没写**沙箱是否已内置 VPN。默认不阻塞预种。打开时还要 `CONTEST_VPN_CONFIG`（配置文件）和 `CONTEST_VPN_EXEC`（本骨架不内置 OpenVPN） |
 | `CONTEST_MAX_CONCURRENCY` | 可选，默认 3 | 超过 3 会被压到平台 max active |
 | `CONTEST_WORKDIR` | 可选 | 每题一个子目录。默认 `<仓库>/contest-work` |
 | `CONTEST_FIXTURE` | 离线 | 指向 challenges JSON，不访问平台。正式托管不要设 |
-| `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。竞赛 profile 必须走 **openai-completions**（responses 流式会丢 function_call） |
+| `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。profile 用 stock Messages（`deepseek-official`），不要把该 id patch 成 openai-completions |
+| `CONTEST_DSH_PROFILE` | `contest-baseline` | 未到点时新 worker 的 `--profile`。bundles 不含 FGS |
+| `CONTEST_DSH_PROFILE_FGS` | `contest` | 到点后新 worker 的 `--profile`。含 FGS + `benchmark_*` |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | driver 启动起算。`>=` 之后的新 worker 用 FGS profile。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
+| `CONTEST_SKIP_FGS_SEED` | `auto` | 仅 FGS profile 预种。baseline 跳过 bootstrap |
+| `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书的时间预算（分钟） |
 | `BENCHMARK_API_PREFIX` | 可选 | 不设时 list/start 先试 `/api/v1`，再试 `/openapi/v1`（与 `tools/submit_flag.mjs` 的提交路径同族） |
 | `RUN` | 可选 | 监管根目录（`workers/`、`monitor/`、`attempted/`）。不设时 entrypoint 用 `CONTEST_WORKDIR` |
 | `CONTEST_SUPERVISOR` | 默认开 | `1`：driver 内循环做 reap / retire / 双护栏补派。`0` 关闭，回到一次性 visit（本地单测） |
@@ -310,9 +315,9 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 1. `list_challenges`（跳过已通关）
 2. `POST {prefix}/challenges/start?unique_code={code}`（query，body `{}`；`prefix` 用 list 成功的那个，托管是 `/openapi/v1`）→ `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
-4. `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`
-5. 验收 `.fgs/competition.json` 的 `activeProblemId`，以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。不过则不拉 dsh
-6. 拉起 dsh（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub，并把该题号记进 `.fgs/dsh-launch.json` 的 `uniqueCode`
+4. 按 driver 启动时钟选 profile（`profile_for_now`，每次 visit 现算）。未到 `CONTEST_FGS_AFTER_SEC` 用 `contest-baseline`，到点后的新 worker 用 `contest`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`
+5. 把对手 Solver 任务书写入 `prompt.txt`（纪律段逐字，题目块来自 list/start）。两边都写这份任务书
+6. 拉起 `dsh --profile <选中的 profile> --json prompt.txt`（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub。`.fgs/dsh-launch.json` 记录 `protocol: anthropic_messages`、`provider: deepseek-official` 和选中的 profile
 
 写盘复用 `ProjectRegistry`、`GraphStore`、`Controller.apply(seedOriginOp)`，不另造图格式。有 `target` 时 origin 正文与 `/fgs new` 一样是 `{target, brief}` 的 JSON。已有 `fact_origin` + `goal_final` 时第二次调用 **幂等成功**，不覆盖图（之后 Decide 写下的 step 还在）。缺 brief、id 非法、cwd 不可写则 exit 1。
 
@@ -328,7 +333,7 @@ stdout 一行 JSON：`status` 为 `seeded` 或 `already-seeded`。
 
 ### 镜像
 
-示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。dsh 需要在正式镜像里另装；这个示例只保证容器一起来就跑 entrypoint，并在 dsh 之前把 FGS 种上。
+示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。dsh 需要在正式镜像里另装。Dockerfile 把 `profiles/contest-baseline` 和 `profiles/contest` 拷到 `$DSH_HOME/profiles/`，并把默认 profile 设成 `contest-baseline`。上传页环境见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)。
 
 ```bash
 docker build -f contest/Dockerfile -t fgs-contest .
@@ -337,7 +342,7 @@ docker build -f contest/Dockerfile -t fgs-contest .
 离线验收（无模型、无平台）：
 
 ```bash
-node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs
+node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs
 ```
 
 ## 契约对照

@@ -1,0 +1,18 @@
+{
+  "name": "dsh-profile-contest",
+  "private": true,
+  "dsh": {
+    "profile": {
+      "bundles": [
+        "@deepseek-ai/dsh-base",
+        "@deepseek-ai/dsh-headless",
+        "@local/contest-benchmark-tools",
+        "@local/fgs-deepseek-dsh"
+      ]
+    }
+  },
+  "dependencies": {
+    "@local/contest-benchmark-tools": "file:/opt/fgs-v4/contest-benchmark-tools",
+    "@local/fgs-deepseek-dsh": "file:/opt/fgs-v4"
+  }
+}

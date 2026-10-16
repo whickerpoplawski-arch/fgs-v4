@@ -4,11 +4,12 @@
 One agent container runs a multi-challenge queue. Max active challenges is
 about 3 (platform cap). Per visit, before any model turn:
 
-  list → start → mkdir workdir/<id> → bootstrap_project.mjs → verify graph → dsh
+  list → start → mkdir workdir/<id> → (FGS profile only) bootstrap → solver brief → dsh
 
-Disk pre-seed writes `.fgs/competition.json` and a project graph that already
-contains `fact_origin` and `goal_final`. The plugin `attachRun` auto-attaches.
-Do not wait for the model to type `/fgs new` or call `fgs_project`.
+``contest-baseline`` does not load the FGS bundle and does not pre-seed a graph.
+``contest`` still pre-seeds ``fact_origin`` / ``goal_final`` for workers started
+after ``CONTEST_FGS_AFTER_SEC``. The choice is per new worker. A running worker
+is not hot-swapped and is not killed to change profiles.
 
 `dsh` is not vendored here. Unless CONTEST_DSH_LAUNCH=1 and `dsh` is on PATH,
 the launch step records a stub under `.fgs/dsh-launch.json`.
@@ -26,7 +27,8 @@ become `http://<host>.tsecbench.gw/...` (https becomes http). It must not
 rewrite BENCHMARK_BASE_URL, BENCHMARK_TOKEN, or Challenges API URLs.
 BENCHMARK_BASE_URL is opaque platform injection and is used as given, even
 when the platform already supplies a `.tsecbench.gw` host. Contest profiles
-must use openai-completions; the responses streaming path drops function_call.
+use stock DeepSeek Messages (``deepseek-official`` + ``https://api.deepseek.com/anthropic``).
+Do not patch that provider id to openai-completions.
 
 Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
   { "challenges": [ { "unique_code", "description", "is_completed", "container_addr": [] } ] }
@@ -57,6 +59,7 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
+from solver_brief import challenge_fields, render_solver_brief
 from supervisor.core import (
     PlatformTransportError,
     SupervisorError,
@@ -105,6 +108,7 @@ PROTECTED_ENVS = (
 )
 PROFILE_URL_KEYS = ("baseURL", "baseUrl", "base_url")
 MAX_ACTIVE = 3
+_DRIVER_STARTED_MONO: float | None = None
 
 
 class DriverError(RuntimeError):
@@ -113,6 +117,119 @@ class DriverError(RuntimeError):
 
 def log(message: str) -> None:
     print(f"contest: {message}", file=sys.stderr)
+
+
+def mark_driver_started() -> float:
+    """Clock for ``CONTEST_FGS_AFTER_SEC``. Process start, not first visit."""
+    global _DRIVER_STARTED_MONO
+    _DRIVER_STARTED_MONO = time.monotonic()
+    return _DRIVER_STARTED_MONO
+
+
+def driver_elapsed(now: float | None = None) -> float:
+    if _DRIVER_STARTED_MONO is None:
+        mark_driver_started()
+    current = time.monotonic() if now is None else now
+    assert _DRIVER_STARTED_MONO is not None
+    return max(0.0, current - _DRIVER_STARTED_MONO)
+
+
+def baseline_profile_name() -> str:
+    return os.environ.get("CONTEST_DSH_PROFILE", "contest-baseline").strip() or "contest-baseline"
+
+
+def fgs_profile_name() -> str:
+    return os.environ.get("CONTEST_DSH_PROFILE_FGS", "contest").strip() or "contest"
+
+
+def profile_has_fgs(profile: str) -> bool:
+    """True when this worker's profile name is the FGS profile.
+
+    Running workers are not rewritten. Callers only use this for a worker
+    that is about to start.
+    """
+    return profile == fgs_profile_name()
+
+
+def fgs_after_sec() -> float | None:
+    """Seconds from driver start before new workers use the FGS profile.
+
+    ``0`` selects the FGS profile immediately. A negative number, or
+    ``off`` / ``never`` / ``false`` / ``no``, keeps the baseline profile
+    for every new worker. The default is 7200.
+    """
+    raw = os.environ.get("CONTEST_FGS_AFTER_SEC", "7200").strip() or "7200"
+    if raw.lower() in ("off", "never", "false", "no"):
+        return None
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise DriverError(f"CONTEST_FGS_AFTER_SEC is not a number: {raw}") from exc
+    if value < 0:
+        return None
+    return value
+
+
+def _fmt_after(value: float | None) -> str:
+    if value is None:
+        return "off"
+    if value.is_integer():
+        return str(int(value))
+    return f"{value:g}"
+
+
+def profile_for_now(*, elapsed: float | None = None, now: float | None = None) -> str:
+    """Profile for a worker that has not started yet.
+
+    Resolved on every call. Do not cache it at process start: after the
+    deadline, the next visit must see the FGS profile. This does not signal
+    any pid.
+    """
+    if elapsed is None:
+        elapsed = driver_elapsed(now)
+    after = fgs_after_sec()
+    if after is None or elapsed < after:
+        selected = baseline_profile_name()
+    else:
+        selected = fgs_profile_name()
+    mode = "FGS on" if profile_has_fgs(selected) else "FGS off"
+    log(
+        f"dsh profile select: elapsed={elapsed:.1f} FGS_AFTER={_fmt_after(after)} "
+        f"→ {selected} ({mode})"
+    )
+    return selected
+
+
+def should_seed_fgs(profile: str) -> bool:
+    """``CONTEST_SKIP_FGS_SEED=auto`` seeds only the FGS profile."""
+    raw = os.environ.get("CONTEST_SKIP_FGS_SEED", "auto").strip().lower() or "auto"
+    if raw in ("1", "true", "yes", "on"):
+        return False
+    if raw in ("0", "false", "no", "off"):
+        return True
+    return profile_has_fgs(profile)
+
+
+def display_target(addrs: list[str]) -> str:
+    """Rival briefs show ``IP:port`` without a scheme."""
+    shown: list[str] = []
+    for raw in addrs:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        if "://" not in text:
+            shown.append(text)
+            continue
+        parts = urllib.parse.urlsplit(text)
+        host = parts.hostname or ""
+        if host and parts.port:
+            shown.append(f"{host}:{parts.port}")
+        elif host:
+            path = parts.path or ""
+            shown.append(host if path in ("", "/") else f"{host}{path}")
+        else:
+            shown.append(text)
+    return ", ".join(shown) if shown else "unknown"
 
 
 def normalize_problem_id(raw: str) -> str:
@@ -556,33 +673,73 @@ def assert_seeded(cwd: Path, problem_id: str) -> None:
         raise DriverError(f"graph missing fact_origin/goal_final: {graph}")
 
 
+def write_challenge_meta(
+    cwd: Path,
+    *,
+    problem_id: str,
+    unique_code: str,
+    challenge: dict | None,
+    addrs: list[str],
+    profile: str,
+    api_prefix: str | None,
+) -> dict[str, str]:
+    fields = challenge_fields(challenge, addrs, unique_code, target=display_target(addrs))
+    payload = {
+        **fields,
+        "problem_id": problem_id,
+        "container_addr": list(addrs),
+        "api_prefix": api_prefix or "",
+        "profile": profile,
+        "fgs": profile_has_fgs(profile),
+    }
+    meta_dir = cwd / ".contest"
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    (meta_dir / "challenge.json").write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return fields
+
+
 def launch_dsh(
     cwd: Path,
     problem_id: str,
     *,
     unique_code: str | None = None,
     background: bool = False,
+    profile: str | None = None,
+    challenge: dict | None = None,
+    addrs: list[str] | None = None,
+    api_prefix: str | None = None,
 ):
     """Start the solver in ``cwd``.
 
     Returns a ``Popen`` when ``background`` is set and a real command exists.
     The stub path writes ``.fgs/dsh-launch.json`` and returns None. The prompt
-    stays a solve prompt: it does not mention reap, retire, or autosup.
+    is the Solver brief: it does not mention reap, retire, or autosup.
 
     The child env copies the parent (so ``BENCHMARK_*`` / ``SOLVER_GATEWAY``
     are not rewritten) and sets ``FGS_UNIQUE_CODE`` to this challenge's id,
     the same value start/close use. The parent environment is left unchanged.
+
+    ``profile`` is resolved here when the caller did not already choose one,
+    so a worker started after the FGS deadline does not keep a stale name.
     """
     code = str(unique_code if unique_code is not None else problem_id).strip()
+    chosen = profile if profile is not None else profile_for_now()
     env = solver_child_env(code)
-    prompt = cwd / "prompt.txt"
-    prompt.write_text(
-        "这道题的 FGS Project 已在磁盘种好（fact_origin 与 goal_final 已存在）。\n"
-        "不要调用 fgs_project，也不要输入 /fgs new。直接用 fgs_open_step 推进。\n"
-        "只做本题。取得有效 flag 并 submit，correct=true 才算完成。\n",
-        encoding="utf-8",
+    fields = write_challenge_meta(
+        cwd,
+        problem_id=problem_id,
+        unique_code=code,
+        challenge=challenge,
+        addrs=list(addrs or []),
+        profile=chosen,
+        api_prefix=api_prefix,
     )
-    command = solver_argv(prompt)
+    prompt = cwd / "prompt.txt"
+    prompt.write_text(render_solver_brief(fields), encoding="utf-8")
+    command = solver_argv(prompt, chosen)
     record = {
         "problemId": problem_id,
         "cwd": str(cwd),
@@ -591,25 +748,30 @@ def launch_dsh(
         or [
             shutil.which(os.environ.get("CONTEST_DSH_BIN", "dsh")) or "dsh",
             "--profile",
-            os.environ.get("CONTEST_DSH_PROFILE", "headless"),
+            chosen,
             "--json",
             str(prompt),
         ],
-        "provider": "openai-completions",
+        "provider": "deepseek-official",
+        "protocol": "anthropic_messages",
+        "profile": chosen,
+        "fgs": profile_has_fgs(chosen),
         "uniqueCode": code,
         "note": (
             "Harness is not launched unless CONTEST_DSH_LAUNCH=1 and dsh is on PATH "
             "(or CONTEST_WORKER_CMD is set). "
-            "The contest profile must use openai-completions; responses streaming drops function_call. "
-            "The graph is already seeded, so the model does not need /fgs new."
+            "Profiles use stock DeepSeek Messages. Do not patch deepseek-official to openai-completions. "
+            "Baseline workers submit with benchmark_submit_flag, not fgs_satisfy_goal."
         ),
     }
-    marker = cwd / ".fgs" / "dsh-launch.json"
+    marker_dir = cwd / ".fgs"
+    marker_dir.mkdir(parents=True, exist_ok=True)
+    marker = marker_dir / "dsh-launch.json"
     if command is None:
         marker.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        log(f"dsh launch stub for {problem_id} (set CONTEST_DSH_LAUNCH=1 when the harness is installed)")
+        log(f"dsh launch stub for {problem_id} profile={chosen} (set CONTEST_DSH_LAUNCH=1 when the harness is installed)")
         return None
-    log(f"launch solver cwd={cwd} background={background} unique_code={code}")
+    log(f"launch solver cwd={cwd} background={background} unique_code={code} profile={chosen}")
     if background:
         proc = subprocess.Popen(command, cwd=str(cwd), env=env, start_new_session=True)
         record["pid"] = proc.pid
@@ -646,22 +808,34 @@ def visit(
             raise DriverError("start returned empty container_addr; skip bootstrap and dsh")
         cwd = workdir / problem_id
         cwd.mkdir(parents=True, exist_ok=True)
-        brief = compose_brief(str(challenge.get("description") or ""), addrs)
-        target = ", ".join(addrs)
-        seeded = bootstrap(cwd, problem_id, brief, target, unique_code=raw_code)
-        assert_seeded(cwd, seeded.get("problemId") or problem_id)
+        profile = profile_for_now()
+        status = "skipped-seed"
+        launched_id = problem_id
+        if should_seed_fgs(profile):
+            brief = compose_brief(str(challenge.get("description") or ""), addrs)
+            target = ", ".join(addrs)
+            seeded = bootstrap(cwd, problem_id, brief, target, unique_code=raw_code)
+            assert_seeded(cwd, seeded.get("problemId") or problem_id)
+            status = seeded.get("status") or "seeded"
+            launched_id = seeded.get("problemId") or problem_id
         proc = launch_dsh(
             cwd,
-            seeded.get("problemId") or problem_id,
+            launched_id,
             unique_code=raw_code,
             background=background,
+            profile=profile,
+            challenge=challenge,
+            addrs=addrs,
+            api_prefix=prefix,
         )
-        log(f"visit {problem_id} {seeded.get('status')}")
+        log(f"visit {problem_id} {status}")
         result = {
             "ok": True,
             "problemId": problem_id,
             "code": raw_code,
-            "status": seeded.get("status"),
+            "status": status,
+            "profile": profile,
+            "fgs": profile_has_fgs(profile),
             "cwd": str(cwd),
             "started": started,
         }
@@ -700,14 +874,14 @@ def supervisor_enabled() -> bool:
     return raw not in ("0", "false", "no", "off")
 
 
-def solver_argv(prompt: Path) -> list[str] | None:
+def solver_argv(prompt: Path, profile: str | None = None) -> list[str] | None:
     custom = os.environ.get("CONTEST_WORKER_CMD", "").strip()
     if custom:
         return shlex.split(custom)
     dsh = shutil.which(os.environ.get("CONTEST_DSH_BIN", "dsh"))
     if os.environ.get("CONTEST_DSH_LAUNCH") == "1" and dsh:
-        profile = os.environ.get("CONTEST_DSH_PROFILE", "headless")
-        return [dsh, "--profile", profile, "--json", str(prompt)]
+        chosen = profile if profile is not None else profile_for_now()
+        return [dsh, "--profile", chosen, "--json", str(prompt)]
     return None
 
 
@@ -1023,6 +1197,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
 
 def main(argv: list[str] | None = None) -> int:
     del argv  # reserved; the visit order is driven by env + the platform, not flags
+    mark_driver_started()
     try:
         require_platform_env()
         # Capture the injected Challenges endpoint before any gateway rewrite.
