@@ -138,4 +138,5 @@ A1–A3 锁的是 `CONTEST_FGS_MODE=after_sec` 的墙钟。`on_fail` 忽略墙�
 - 网关是否放行 `…/anthropic/v1/messages` 需要看托管白名单。只放行 `/v1/chat/completions` 时 Messages 会失败。
 - 一遍和二遍工具面不同。斜率看 baseline 新题；FGS 只收已经失败的题，默认同时只有 1 个，而且排在新题后面。
 - 多 flag：Solver 任务书要求看 `correct_flag_count` / `total_flag_count`。`CONTEST_RETIRE_GRACE_SOLVED` 只在平台判定通关后缩短宽限，不要在 1/N 时当 solved 关掉。
+- Solver 任务书另有输出纪律：工具调用前可见文字 ≤2 句，通关后只交 flag 加一句结论。
 - 标题旁路会话（`Generate the session title`）两边都有。统计只计解题会话。

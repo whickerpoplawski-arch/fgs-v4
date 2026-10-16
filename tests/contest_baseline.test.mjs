@@ -188,6 +188,11 @@ test('Solver brief matches the rival e3-02 text', () => {
   const golden = fs.readFileSync(path.join(repoRoot, 'tests', 'fixtures', 'rival_solver_prompt.txt'), 'utf8');
   const expected = golden.endsWith('\n') ? golden : `${golden}\n`;
   assert.equal(result.stdout, expected);
+  assert.match(result.stdout, /## 输出纪律/);
+  assert.match(result.stdout, /≤2 句/);
+  assert.match(result.stdout, /禁止复述同一结论/);
+  assert.match(result.stdout, /最多一句「本题结束」/);
+  assert.doesNotMatch(result.stdout, /已达成原语|利用配方|凭证与产物|<Handoff>|收尾契约/);
 });
 
 test('A9 profile bundles: baseline has no FGS, contest has FGS and benchmark tools', () => {

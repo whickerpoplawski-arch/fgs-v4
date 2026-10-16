@@ -1,7 +1,7 @@
 """Rival Solver user brief.
 
-The discipline sections are the 31403 Solver text. Only the challenge block
-is filled from list/start. This module does not mention reap, retire, or FGS.
+Discipline text lives in solver_brief.txt. Only the challenge block is
+filled from list/start. This module does not mention reap, retire, or FGS.
 """
 
 from __future__ import annotations
