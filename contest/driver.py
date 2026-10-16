@@ -17,9 +17,13 @@ VPN (optional): CONTEST_VPN=1 requires CONTEST_VPN_CONFIG and CONTEST_VPN_EXEC.
 Hosted sandbox VPN presence is ambiguous (integration docs vs upload page);
 the default leaves VPN off and does not block pre-seed.
 
-SOLVER_GATEWAY=1 rewrites model base URLs to `http://<host>.tsecbench.gw/...`
-(https becomes http). Contest profiles must use openai-completions; the
-responses streaming path drops function_call.
+SOLVER_GATEWAY=1 rewrites model base URLs only: env vars such as
+DEEPSEEK_BASE_URL / OPENAI_BASE_URL, and a contest profile's baseURL field,
+become `http://<host>.tsecbench.gw/...` (https becomes http). It must not
+rewrite BENCHMARK_BASE_URL, BENCHMARK_TOKEN, or Challenges API URLs. The
+gateway allowlist is LLM APIs; the platform host is not on it. Contest
+profiles must use openai-completions; the responses streaming path drops
+function_call.
 
 Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
   { "challenges": [ { "unique_code", "description", "is_completed", "container_addr": [] } ] }
@@ -52,6 +56,8 @@ from supervisor.core import (
     acquire_lock,
     append_log,
     archive_worker,
+    attach_platform_headers,
+    challenge_url,
     count_active,
     dispatch_budget,
     grace_settings,
@@ -71,13 +77,23 @@ from supervisor.core import (
 ROOT = Path(__file__).resolve().parent.parent
 BOOTSTRAP = ROOT / "tools" / "bootstrap_project.mjs"
 DEFAULT_CRITERION = "取得有效 flag 并 submit correct=true"
+# Explicit allowlist. Do not scan os.environ for http(s) values: BENCHMARK_BASE_URL
+# is also an https URL, and the solver gateway rejects the Challenges API host.
 MODEL_URL_ENVS = (
     "OPENAI_BASE_URL",
     "OPENAI_API_BASE",
     "SOLVER_BASE_URL",
     "DEEPSEEK_BASE_URL",
     "ANTHROPIC_BASE_URL",
+    "LLM_BASE_URL",
 )
+PROTECTED_ENVS = (
+    "BENCHMARK_BASE_URL",
+    "BENCHMARK_TOKEN",
+    "PLATFORM_BASE_URL",
+    "BENCHMARK_API_PREFIX",
+)
+PROFILE_URL_KEYS = ("baseURL", "baseUrl", "base_url")
 MAX_ACTIVE = 3
 
 
@@ -95,17 +111,51 @@ def normalize_problem_id(raw: str) -> str:
     return re.sub(r"[^a-z0-9_-]", "_", text)[:64]
 
 
+def protected_platform_hosts() -> set[str]:
+    """Hosts of the injected Challenges API. The gateway must not see these."""
+    hosts: set[str] = set()
+    for name in ("BENCHMARK_BASE_URL", "PLATFORM_BASE_URL"):
+        raw = os.environ.get(name, "").strip()
+        if not raw:
+            continue
+        host = urllib.parse.urlsplit(raw).hostname
+        if host:
+            hosts.add(host.lower())
+    return hosts
+
+
+def is_protected_platform_url(url: str) -> bool:
+    """True for the platform host and for any Challenges API path."""
+    parts = urllib.parse.urlsplit(str(url or "").strip())
+    host = (parts.hostname or "").lower()
+    if not host:
+        return False
+    protected = protected_platform_hosts()
+    if host in protected or (host.endswith(".tsecbench.gw") and _bare_gateway_host(host) in protected):
+        return True
+    path = parts.path or ""
+    return "/api/v1/challenges" in path or "/openapi/v1/challenges" in path
+
+
+def _bare_gateway_host(host: str) -> str:
+    suffix = ".tsecbench.gw"
+    return host[: -len(suffix)] if host.endswith(suffix) else host
+
+
 def rewrite_model_base(url: str) -> str:
     """Apply the hosted gateway rewrite when SOLVER_GATEWAY=1.
 
     https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1
     Hosts that already end in `.tsecbench.gw` are not double-suffixed.
+    BENCHMARK_BASE_URL and Challenges API URLs are returned unchanged.
     """
     raw = str(url or "").strip()
     if not raw or os.environ.get("SOLVER_GATEWAY") != "1":
         return raw
     parts = urllib.parse.urlsplit(raw)
     if parts.scheme not in ("http", "https") or not parts.hostname:
+        return raw
+    if is_protected_platform_url(raw):
         return raw
     host = parts.hostname
     if not host.endswith(".tsecbench.gw"):
@@ -121,18 +171,149 @@ def rewrite_model_base(url: str) -> str:
     return urllib.parse.urlunsplit(("http", netloc, parts.path, parts.query, parts.fragment))
 
 
+def _profile_dirs() -> list[Path]:
+    """Contest profile roots.
+
+    ``CONTEST_DSH_PROFILE_DIR`` is the only root when set (tests use this).
+    Otherwise ``$DSH_HOME/profiles`` is scanned. ``~/.dsh`` is not implied, so a
+    local ``SOLVER_GATEWAY=1`` run does not rewrite a developer profile.
+    """
+    explicit = os.environ.get("CONTEST_DSH_PROFILE_DIR", "").strip()
+    if explicit:
+        return [Path(explicit)]
+    dsh_home = os.environ.get("DSH_HOME", "").strip()
+    if dsh_home:
+        return [Path(dsh_home) / "profiles"]
+    return []
+
+
+def _rewrite_yaml_profile(text: str) -> str:
+    """Rewrite only baseURL keys. Other URL lines, including the platform host, stay."""
+    pattern = re.compile(r"^(\s*)(baseURL|baseUrl|base_url)(\s*:\s*)(.*)$")
+    lines: list[str] = []
+    changed = False
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\r\n")
+        ending = line[len(body) :]
+        match = pattern.match(body)
+        if not match:
+            lines.append(line)
+            continue
+        raw_value = match.group(4).strip()
+        quote = ""
+        comment = ""
+        inner = raw_value
+        if raw_value[:1] in ("'", '"'):
+            quote = raw_value[0]
+            end = raw_value.find(quote, 1)
+            if end < 0:
+                lines.append(line)
+                continue
+            inner = raw_value[1:end]
+            comment = raw_value[end + 1 :]
+        elif " #" in raw_value:
+            inner, comment = raw_value.split(" #", 1)
+            inner = inner.strip()
+            comment = " #" + comment
+        if not inner or is_protected_platform_url(inner):
+            lines.append(line)
+            continue
+        rewritten = rewrite_model_base(inner)
+        if rewritten == inner:
+            lines.append(line)
+            continue
+        rendered = f"{quote}{rewritten}{quote}{comment}" if quote else f"{rewritten}{comment}"
+        lines.append(f"{match.group(1)}{match.group(2)}{match.group(3)}{rendered}{ending}")
+        changed = True
+    return "".join(lines) if changed else text
+
+
+def _rewrite_json_profile(node) -> bool:
+    changed = False
+    if isinstance(node, dict):
+        for key, value in list(node.items()):
+            if key in PROFILE_URL_KEYS and isinstance(value, str):
+                if value and not is_protected_platform_url(value):
+                    rewritten = rewrite_model_base(value)
+                    if rewritten != value:
+                        node[key] = rewritten
+                        changed = True
+            elif isinstance(value, (dict, list)) and _rewrite_json_profile(value):
+                changed = True
+    elif isinstance(node, list):
+        for item in node:
+            if isinstance(item, (dict, list)) and _rewrite_json_profile(item):
+                changed = True
+    return changed
+
+
+def rewrite_profile_bases() -> None:
+    """Rewrite contest-profile baseURL fields only. Never walk arbitrary URL strings."""
+    if os.environ.get("SOLVER_GATEWAY") != "1":
+        return
+    for root in _profile_dirs():
+        if not root.is_dir():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            if "node_modules" in path.parts or ".git" in path.parts:
+                continue
+            if path.suffix.lower() not in {".json", ".yml", ".yaml"}:
+                continue
+            try:
+                if path.stat().st_size > 1_000_000:
+                    continue
+                original = path.read_text(encoding="utf-8")
+            except OSError as exc:
+                log(f"profile rewrite skipped {path}: {exc}")
+                continue
+            if path.suffix.lower() == ".json":
+                try:
+                    payload = json.loads(original)
+                except json.JSONDecodeError:
+                    log(f"profile rewrite skipped {path}: not JSON")
+                    continue
+                if not _rewrite_json_profile(payload):
+                    continue
+                path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                log(f"rewrote profile baseURL in {path}")
+                continue
+            rewritten = _rewrite_yaml_profile(original)
+            if rewritten == original:
+                continue
+            path.write_text(rewritten, encoding="utf-8")
+            log(f"rewrote profile baseURL in {path}")
+
+
 def apply_gateway_rewrites() -> None:
+    """Rewrite model endpoints onto *.tsecbench.gw. Leave the Challenges API alone."""
     if os.environ.get("SOLVER_GATEWAY") != "1":
         log("SOLVER_GATEWAY is off; model base URLs are unchanged")
         return
+    saved = {name: os.environ.get(name) for name in PROTECTED_ENVS}
     for name in MODEL_URL_ENVS:
+        if name in PROTECTED_ENVS:
+            continue
         current = os.environ.get(name, "").strip()
-        if not current:
+        if not current or is_protected_platform_url(current):
             continue
         rewritten = rewrite_model_base(current)
         if rewritten != current:
             os.environ[name] = rewritten
             log(f"rewrote {name}: {current} → {rewritten}")
+    for name, value in saved.items():
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
+    benchmark = os.environ.get("BENCHMARK_BASE_URL", "").strip()
+    if benchmark:
+        log(f"BENCHMARK_BASE_URL unchanged: {benchmark}")
+    rewrite_profile_bases()
 
 
 def require_platform_env() -> None:
@@ -175,11 +356,7 @@ def vpn_preflight() -> None:
 def _request(method: str, url: str, token: str, body: dict | None = None):
     data = None if body is None else json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, method=method)
-    req.add_header("authorization", f"Bearer {token}")
-    req.add_header("x-benchmark-token", token)
-    req.add_header("accept", "application/json")
-    if body is not None:
-        req.add_header("content-type", "application/json")
+    attach_platform_headers(req, token, json_body=body is not None)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read().decode("utf-8")
@@ -247,7 +424,10 @@ def api_prefixes() -> list[str]:
 def list_challenges_live(base: str, token: str):
     errors = []
     for prefix in api_prefixes():
-        url = base.rstrip("/") + prefix + "/challenges"
+        try:
+            url = challenge_url(base, prefix + "/challenges")
+        except SupervisorError as exc:
+            raise DriverError(str(exc)) from exc
         try:
             _status, payload = _request("GET", url, token)
         except DriverError as exc:
@@ -265,7 +445,10 @@ def start_challenge_live(base: str, prefix: str, token: str, code: str) -> list[
     ]
     errors = []
     for path, body in candidates:
-        url = base.rstrip("/") + path
+        try:
+            url = challenge_url(base, path)
+        except SupervisorError as exc:
+            raise DriverError(str(exc)) from exc
         try:
             _status, payload = _request("POST", url, token, body)
         except DriverError as exc:
@@ -745,13 +928,18 @@ def main(argv: list[str] | None = None) -> int:
     del argv  # reserved; the visit order is driven by env + the platform, not flags
     try:
         require_platform_env()
+        # Capture the injected Challenges endpoint before any gateway rewrite.
+        # apply_gateway_rewrites must not touch these; the snapshot is what list,
+        # start, and close actually call.
+        token = os.environ["BENCHMARK_TOKEN"].strip()
+        base = os.environ["BENCHMARK_BASE_URL"].strip()
         apply_gateway_rewrites()
+        os.environ["BENCHMARK_TOKEN"] = token
+        os.environ["BENCHMARK_BASE_URL"] = base
         vpn_preflight()
         workdir = Path(os.environ.get("CONTEST_WORKDIR", str(ROOT / "contest-work"))).resolve()
         workdir.mkdir(parents=True, exist_ok=True)
         fixture_path = os.environ.get("CONTEST_FIXTURE", "").strip()
-        token = os.environ["BENCHMARK_TOKEN"].strip()
-        base = os.environ["BENCHMARK_BASE_URL"].strip()
         if not supervisor_enabled():
             log("supervisor off")
             return run_once(workdir, token, base, fixture_path)

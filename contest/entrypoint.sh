@@ -29,8 +29,12 @@ if [ -z "${BENCHMARK_BASE_URL:-}" ]; then
   exit 1
 fi
 
-# SOLVER_GATEWAY=1: the driver rewrites allowlisted model base URLs
+# SOLVER_GATEWAY=1: the driver rewrites model base URLs only
+#   (DEEPSEEK_BASE_URL, OPENAI_BASE_URL, and baseURL inside $DSH_HOME/profiles
+#   or $CONTEST_DSH_PROFILE_DIR):
 #   https://api.deepseek.com/v1 → http://api.deepseek.com.tsecbench.gw/v1
+# This script does not rewrite env or profiles. BENCHMARK_BASE_URL,
+# BENCHMARK_TOKEN, and Challenges API URLs stay as the platform injected them.
 # Hosted sandboxes have no public internet. Leave the flag unset for local runs.
 #
 # VPN is optional. Integration docs say challenge addresses need a task VPN;

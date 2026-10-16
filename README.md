@@ -249,7 +249,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `BENCHMARK_TOKEN` | 平台注入 | 缺则 `contest/entrypoint.sh` **exit 1**。不要写进镜像，也不要填在上传页 |
 | `BENCHMARK_BASE_URL` | 平台注入 | 同上 |
 | 模型 key / base URL | 上传页环境 | 运行时读取。镜像内剥离密钥 |
-| `SOLVER_GATEWAY=1` | 选手运行时 | 白名单模型基址改写：`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`（https→http，主机名后加 `.tsecbench.gw`）。托管沙箱没有公网。本地调试不要设 |
+| `SOLVER_GATEWAY=1` | 选手运行时 | 只改写模型基址（`DEEPSEEK_BASE_URL`、`OPENAI_BASE_URL` 等）和竞赛 profile 的 `baseURL`：`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`（https→http，主机名后加 `.tsecbench.gw`）。不改 `BENCHMARK_BASE_URL`、`BENCHMARK_TOKEN`，也不改 Challenges API URL。托管沙箱没有公网。本地调试不要设 |
 | `CONTEST_VPN` | 可选，默认关 | integration 文档写访问题址要任务 VPN；托管上传页**没写**沙箱是否已内置 VPN。默认不阻塞预种。打开时还要 `CONTEST_VPN_CONFIG`（配置文件）和 `CONTEST_VPN_EXEC`（本骨架不内置 OpenVPN） |
 | `CONTEST_MAX_CONCURRENCY` | 可选，默认 3 | 超过 3 会被压到平台 max active |
 | `CONTEST_WORKDIR` | 可选 | 每题一个子目录。默认 `<仓库>/contest-work` |
