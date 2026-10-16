@@ -6,6 +6,11 @@
 # start: validate the injected env, then exec the driver. The driver lists
 # challenges, starts each one, disk-seeds FGS, and only then launches dsh.
 #
+# CONTEST_SUPERVISOR defaults on. Reap / retire / the dual-guard refill run
+# inside the driver so there is one scheduler. This script does not start
+# contest/supervisor/autosup.sh (that loop is the worker-directory layout and
+# would dispatch a second time).
+#
 # Do not bake BENCHMARK_TOKEN, BENCHMARK_BASE_URL, or LLM keys into the image.
 # The platform injects the first two at runtime. Fill model keys on the upload
 # page (or a runtime env file), never in this script.
@@ -32,5 +37,25 @@ fi
 # the hosted upload page does not say the sandbox already includes one.
 # Default is off (CONTEST_VPN unset) so pre-seed is not blocked on that ambiguity.
 # Set CONTEST_VPN=1 plus CONTEST_VPN_CONFIG and CONTEST_VPN_EXEC to opt in.
+#
+# CONTEST_SUPERVISOR=0 skips the in-driver loop (local one-shot). Any other
+# value, including unset, turns it on.
+
+case "${CONTEST_SUPERVISOR:-1}" in
+  0|false|no|off|FALSE|NO|OFF)
+    export CONTEST_SUPERVISOR=0
+    ;;
+  *)
+    export CONTEST_SUPERVISOR=1
+    ;;
+esac
+
+if [ -z "${RUN:-}" ]; then
+  if [ -n "${CONTEST_WORKDIR:-}" ]; then
+    export RUN="$CONTEST_WORKDIR"
+  else
+    export RUN="$ROOT/contest-work"
+  fi
+fi
 
 exec python3 "$ROOT/contest/driver.py" "$@"
