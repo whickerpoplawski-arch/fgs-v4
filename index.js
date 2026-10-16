@@ -203,6 +203,8 @@ const DEFAULT_CONFIG = Object.freeze({
   stateDir: '.fgs',
   factContentMaxBytes: 8 * 1024,
   factTitleMaxChars: 120,
+  // 未写进 cordis.patch.yml 时的本地回退。竞赛镜像以 patch 为准，必须是 command
+  // （regex 只认形态，不会 POST Challenges submit，SCORE 不涨）。
   verifyMode: 'regex',
   // 真实竞赛（百度）用小写 flag{...}；早期默认是全大写且无 i，导致真 flag 也被硬门拒收。
   flagPattern: 'flag\\{[^}\\s]{4,}\\}',

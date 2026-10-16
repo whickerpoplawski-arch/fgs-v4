@@ -32,6 +32,7 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_RETIRE_GRACE` | `60` |
 | `CONTEST_RETIRE_GRACE_SOLVED` | `30` |
 | `CONTEST_SUPERVISOR_INTERVAL` | `20` |
+| `FGS_UNIQUE_CODE` | driver 按题注入 | 与 start/close 的 `unique_code` 相同。不要在上传页设成一个全局值。缺了则 `submit_flag.mjs` fail-closed，SCORE 不涨 |
 
 `CONTEST_SUPERVISOR_INTERVAL` 是 driver 循环和手动 `autosup` 两轮之间的休眠秒数。`0` 仍合法（不休眠）。别名 `GRACE` / `GRACE_SOLVED` 仍覆盖对应的 `CONTEST_RETIRE_*`。
 

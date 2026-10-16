@@ -7,6 +7,27 @@
 import { readFileSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+/** 插件根目录。`cordis.patch.yml` 里 verifyCommand 的 `./` 相对这里，不是 worker cwd。 */
+export const PLUGIN_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * 把 verifyCommand 里的 `./相对路径` 解析到插件目录。
+ * worker 的 cwd 是题目工作区，`node ./tools/submit_flag.mjs` 若不改写会找不到脚本，
+ * satisfy 在 POST 之前失败，SCORE 仍然不涨。
+ */
+export function resolveVerifyCommand(command, pluginRoot = PLUGIN_ROOT) {
+  const root = path.resolve(pluginRoot);
+  return String(command).replace(/(^|\s)\.\/(?!\.)([^\s'"]*)/g, (_, prefix, rest) => {
+    const abs = path.join(root, rest);
+    return `${prefix}${shellSingleQuote(abs)}`;
+  });
+}
 
 /**
  * 赛方 flag 正则示例。**默认按小写写，并配 `i` 编译**：
@@ -101,6 +122,7 @@ export function makeDenyAllVerify(reason = 'verifyMode=none：未配置 FLAG 外
 export function makeCommandVerify(command, options = {}) {
   const timeout = options.timeoutMs ?? 20_000;
   const cwd = options.cwd ?? process.cwd();
+  const resolved = resolveVerifyCommand(command);
   return (graph, op) => {
     const payload = {
       goalId: op.goalId,
@@ -110,7 +132,7 @@ export function makeCommandVerify(command, options = {}) {
         .filter((f) => (op.satisfiedBy ?? []).includes(f.id))
         .map((f) => ({ id: f.id, title: f.title, content: f.content ?? null })),
     };
-    const result = spawnSync(command, {
+    const result = spawnSync(resolved, {
       shell: true,
       input: JSON.stringify(payload),
       encoding: 'utf8',
@@ -143,7 +165,8 @@ export function makeCommandVerify(command, options = {}) {
  * - regex（默认）：satisfyFlagMode=any 时任一条 fact 匹配 flagPattern 即可；all 则逐条都要
  * - local：同上，比对 expectedFlag
  * - command：外部校验命令（赛方 ACK / 提交回执），退出码 0 才算过；
- *   插件把 satisfiedBy 引用的全部 fact 交给命令（submit_flag 按合并文本抽 flag，不是逐条 AND）
+ *   命令里的 `./` 相对本插件目录。插件把 satisfiedBy 引用的全部 fact 交给命令
+ *   （submit_flag 按合并文本抽 flag，不是逐条 AND）
  * - 其它/未识别/none：回退到 regex（fail-closed；要放行请把 flagPattern 显式设宽，
  *   让「本运行不做外部校验」这件事留在配置里可见，而不是把门拆掉）
  */

@@ -138,9 +138,11 @@ test('真实 cordis.patch.yml 里的 flag 配置能匹配竞赛真题的小写 f
   // 回归 b-02 真题素材暴露的问题：patch 里显式写死过大写 pattern +
   // 且没有 i，导致真 flag 也被 §8 硬门拒收。patch 是实际生效的配置，
   // 所以必须直接对着文件断言，光改 DEFAULT_CONFIG 不够。
+  // 真赛默认必须是 command：regex 只认形态，不会 POST Challenges submit。
   const text = fs.readFileSync(path.join(here, '..', 'cordis.patch.yml'), 'utf8');
   const config = load(text)[0].insert[0].config;
-  assert.equal(config.verifyMode, 'regex');
+  assert.equal(config.verifyMode, 'command');
+  assert.equal(config.verifyCommand, 'node ./tools/submit_flag.mjs');
   const flags = String(config.flagFlags ?? '').replace(/g/g, '');
   const re = new RegExp(config.flagPattern, flags);
   assert.ok(re.test('flag{abc12345}'), `patch 的 flag 配置匹配不了真题形态: ${config.flagPattern}`);

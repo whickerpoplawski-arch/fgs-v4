@@ -189,6 +189,33 @@ test('cwd 不可写则失败', { skip: typeof process.getuid === 'function' && p
   }
 });
 
+test('显式 uniqueCode 写入 fact_origin，缺省时不改 {target, brief}', () => {
+  const cwd = tmpDir('fgs-boot-code-');
+  const seeded = bootstrapProject({
+    cwd,
+    problemId: 'e2-01',
+    brief: '带题号',
+    target: 'http://10.0.0.8:8080',
+    uniqueCode: 'E2-01',
+  });
+  assert.equal(seeded.status, 'seeded');
+  const origin = JSON.parse(new GraphStore(path.join(cwd, '.fgs', 'projects', 'e2-01')).load().facts[0].content);
+  assert.equal(origin.target, 'http://10.0.0.8:8080');
+  assert.equal(origin.unique_code, 'E2-01');
+  assert.match(origin.brief, /带题号/);
+
+  const plain = tmpDir('fgs-boot-nocode-');
+  bootstrapProject({
+    cwd: plain,
+    problemId: 'e2-02',
+    brief: '无题号',
+    target: 'http://10.0.0.9:8080',
+  });
+  const bare = JSON.parse(new GraphStore(path.join(plain, '.fgs', 'projects', 'e2-02')).load().facts[0].content);
+  assert.equal(bare.target, 'http://10.0.0.9:8080');
+  assert.equal(Object.hasOwn(bare, 'unique_code'), false);
+});
+
 test('CLI：种题 exit 0，重复幂等，缺 id exit 1', () => {
   const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'fgs-boot-cli-'));
   const first = runCli([

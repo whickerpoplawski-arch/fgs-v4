@@ -10,17 +10,27 @@
  *
  * 启动后向 stdout 打印一行 `PORT <port>`，父测试据此拿地址。
  */
+import fs from 'node:fs';
 import http from 'node:http';
 
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (chunk) => { body += chunk; });
   req.on('end', () => {
-    let flag = '';
+    let parsed = null;
     try {
-      flag = String(JSON.parse(body)?.flag ?? '');
+      parsed = JSON.parse(body);
     } catch {
       /* 非法 JSON 按判错处理 */
+    }
+    const flag = String(parsed?.flag ?? '');
+    const hitFile = process.env.STUB_HIT_FILE;
+    if (hitFile) {
+      fs.appendFileSync(hitFile, `${JSON.stringify({
+        method: req.method,
+        path: req.url,
+        body: parsed,
+      })}\n`);
     }
     let status = 200;
     if (flag.includes('dup')) status = 409;

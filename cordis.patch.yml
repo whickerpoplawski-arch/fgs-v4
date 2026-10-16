@@ -4,14 +4,17 @@
       name: '@local/fgs-deepseek-dsh'
       config:
         stateDir: .fgs
-        # regex = 只校验 fact 文本里出现过 flag 形态；真正比赛建议改用 command：
-        # verifyMode: command
-        # verifyCommand: 'node ./tools/submit_flag.mjs'   # 相对本插件目录；也可写任意绝对路径
-        #   （把证据写到 stdin，脚本调赛方提交接口，退出码 0 = 过；409 重复提交也按过）
+        # 真赛默认 command：§8 hook 在写 satisfied* 之前跑 submit_flag.mjs，
+        # POST /openapi/v1/challenges/submit。regex 只认 flag 形态，SCORE 不计分，禁止上赛场。
+        # 本地练习可在自己的 profile 覆盖成 regex。
+        # verifyCommand 里的 ./ 相对本插件目录（不是 worker cwd）；也可写绝对路径。
+        # 退出码 0 = 过；409 重复提交也按过。
+        verifyMode: command
+        verifyCommand: 'node ./tools/submit_flag.mjs'
         # 单题 Execute 墙钟（毫秒）。到期写未完成 Fact 并释放认领，不关 step。
         # 与 stepLeaseMs（认领租约，默认 30min，代码默认）不是一回事。
         executeSessionTtlMs: 600000
-        verifyMode: regex
         # 真实竞赛（百度）用小写 flag{...}：pattern 按小写写，靠 flagFlags: i 同时兼容 FLAG{...}
+        # submit_flag 仍用它从 fact 抽 flag。
         flagPattern: 'flag\{[^}\s]{4,}\}'
         flagFlags: i

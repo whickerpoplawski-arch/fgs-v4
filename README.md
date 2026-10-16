@@ -1,12 +1,13 @@
 ## 这几条最重要
 
-装插件、做自己的竞赛镜像，先核对这五条：
+装插件、做自己的竞赛镜像，先核对这六条：
 
 1. **模型**：只用 `openai-completions`（`responses` 流式会丢 `function_call`）。provider id 不要用 `deepseek-official`，换成唯一 id，例如 `deepseek-contest`。
 2. **托管上传环境变量**：只填 `DEEPSEEK_API_KEY` 和 `SOLVER_GATEWAY=1`。不要设 `BENCHMARK_*`（平台运行时注入）。
 3. **镜像要能跑 bash**：安装 `bubblewrap`（`bwrap`），和/或把 DSH 默认权限设成 `danger-full-access`，`approval.policy` 设为 `never`。
 4. **打靶**：用 `bash` / `curl` 打挑战目标。`web_fetch` 会拒私网 IP（`10.0.177.x`）。
 5. **开题**：`POST .../challenges/start?unique_code=`（`unique_code` 放在 query）。`5624fa3` 已经是这个写法。
+6. **交 flag（SCORE）**：竞赛 `cordis.patch.yml` 必须是 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 `POST /openapi/v1/challenges/submit`，本地可以多次显示「goal_final 已满足」，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
 
 ---
 
@@ -93,6 +94,7 @@ TSecBench 托管容器在插件之外还要：
 - **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` → 磁盘预种 → `dsh`。预种在任何模型回合之前完成，不要等模型敲 `/fgs new` 或调用 `fgs_project`。
 - 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`。
 - **不要设置** `BENCHMARK_*`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入；不要写进镜像，也不要填在上传页。
+- **交 flag** 走插件 §8，不另开旁路。竞赛镜像保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`；不要把 `regex` 打进竞赛镜像。
 - 竞赛 profile 用 **openai-completions**（responses 流式会丢 `function_call`）。模型 base URL 用网关白名单上的 LLM 基址，例如 `https://api.deepseek.com/v1`。`SOLVER_GATEWAY=1` 只改写 `DEEPSEEK_BASE_URL` / `OPENAI_BASE_URL` 等和 profile 的 `baseURL`（`https://api.deepseek.com/v1` → `http://api.deepseek.com.tsecbench.gw/v1`），不改 `BENCHMARK_*` 和 Challenges API。
 
 没有 contest driver，或 `CONTEST_SUPERVISOR` 不是 `1`，**reap / retire 不会运行**。
@@ -220,14 +222,15 @@ docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES /
                                        #   故「>8 KiB 且是路径」这一分支不可达。蒸馏意图不变：
                                        #   大产物落文件，fact 里只放结论与路径。
         factTitleMaxChars: 120
-        verifyMode: regex              # regex | local | command（不存在关门的 none：§8 必须有硬门）
-        flagPattern: 'flag\{[^}\s]{4,}\}'   # 真实竞赛（百度）用**小写** flag{...}
+        verifyMode: command            # 真赛默认。regex | local 仅本地练习（不存在关门的 none：§8 必须有硬门）
+        flagPattern: 'flag\{[^}\s]{4,}\}'   # 真实竞赛（百度）用**小写** flag{...}；submit_flag 也用它抽 flag
         flagFlags: i                   # 忽略大小写编译，同时兼容 FLAG{...}；'g' 会被剔除
         expectedFlag: ''               # verifyMode=local 时必填
-        verifyCommand: ''              # verifyMode=command：读 stdin 的校验命令，退出码 0 = 通过
+        verifyCommand: 'node ./tools/submit_flag.mjs'
+                                       # verifyMode=command：读 stdin 的校验命令，退出码 0 = 通过
+                                       #   ./ 相对本插件目录，不是 worker cwd
                                        #   stdin 收到 {goalId, reason, satisfiedBy, facts[]}；
                                        #   stdout 若是 {"ok":false,"reason":"…"} 也按拒绝
-                                       #   真实比赛请用仓库自带 tools/submit_flag.mjs（见下）
         decideAllowTools: [todo_write, skill, ask_user_question, exit_plan_mode, cordis_inspect_list, cordis_inspect_query]
                                        # Decide 轮白名单：不在表里的工具（bash/文件/网络/subagent/workflow…）一律拒
         maxResultChars: 8000           # 图工具出参截断（io-specs 的 max_result_chars）
@@ -243,22 +246,23 @@ FLAG 硬门**不可关闭**（`CONTRACT §8`）：`verifyMode` 没有 `none`，�
 fail-closed 回退到 regex。要放行请把 `flagPattern` 显式设宽——让「本运行不做外部校验」
 留在配置里可见，而不是把门拆掉。
 
-### 真实比赛用 `verifyMode: command`
+### 真赛默认就是 `verifyMode: command`
 
-`regex` 只能校验「fact 文本里出现过 flag 形态」，**不能证明这个 flag 真的对**。
-真实竞赛的判对发生在赛方提交接口，所以应该改成 `command`：
+`cordis.patch.yml` 已经是 `command` + `node ./tools/submit_flag.mjs`。不要改回 `regex` 再上赛场。
 
-```yaml
-verifyMode: command
-verifyCommand: 'node /path/to/fgs-deepseek-dsh/tools/submit_flag.mjs'
-```
+`regex` 只能校验「fact 文本里出现过 flag 形态」，**不能证明这个 flag 真的对**，也**不会**
+`POST ${BENCHMARK_BASE_URL}/openapi/v1/challenges/submit`。harness 可以多次报「goal_final 已满足」，
+SCORE 面板仍然不涨。本地练习可以在自己的 profile 里覆盖成 `regex`。
 
 `tools/submit_flag.mjs` 会：从 `facts` 文本抽出全部 flag → 逐个 POST 到
 `${BENCHMARK_BASE_URL}/openapi/v1/challenges/submit`（带 `BENCHMARK_TOKEN`）→
 `200/201` 判对、**`409` 重复提交也按已判对**（说明此前已提交成功）→ 全部通过才 exit 0。
+只有这一步通过，§8 hook 才允许写 `satisfied*`。
 
 需要的环境变量：`BENCHMARK_BASE_URL`（或 `PLATFORM_BASE_URL`）、`BENCHMARK_TOKEN`、
-`FGS_UNIQUE_CODE`（如 `b-02`，也可在 fact 文本里带 `"unique_code"`）。
+`FGS_UNIQUE_CODE`（如 `b-02`，也可在被引用的 fact 文本里带 `"unique_code"`）。
+`contest/driver.py` 的 `launch_dsh` 按题注入 `FGS_UNIQUE_CODE`，值与 start/close 的题号相同，
+并且不改写 `BENCHMARK_*`。不要在上传页设一个全局 `FGS_UNIQUE_CODE`。
 三者缺任一、或接口不可达、或抽不到 flag → **一律 fail-closed 拒收**（宁可挡住一次真 flag）。
 
 > 为什么 `regex` 的默认值改过：早期默认是 `FLAG\{[^}\s]{4,}\}`（全大写 + 没有 `i`），
@@ -307,7 +311,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
 4. `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`
 5. 验收 `.fgs/competition.json` 的 `activeProblemId`，以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。不过则不拉 dsh
-6. 拉起 dsh（cwd = 该目录）。harness 未装时写 launch stub
+6. 拉起 dsh（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub，并把该题号记进 `.fgs/dsh-launch.json` 的 `uniqueCode`
 
 写盘复用 `ProjectRegistry`、`GraphStore`、`Controller.apply(seedOriginOp)`，不另造图格式。有 `target` 时 origin 正文与 `/fgs new` 一样是 `{target, brief}` 的 JSON。已有 `fact_origin` + `goal_final` 时第二次调用 **幂等成功**，不覆盖图（之后 Decide 写下的 step 还在）。缺 brief、id 非法、cwd 不可写则 exit 1。
 

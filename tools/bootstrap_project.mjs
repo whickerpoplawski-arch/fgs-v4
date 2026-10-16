@@ -13,7 +13,7 @@
  * 用法:
  *   node tools/bootstrap_project.mjs \
  *     --cwd <workspace> --problem-id <id> --brief <text> \
- *     [--criterion <text>] [--target <addr>] [--brief-file <path>]
+ *     [--criterion <text>] [--target <addr>] [--unique-code <id>] [--brief-file <path>]
  *
  * 本地单题调试可读 FGS_WORKSPACE / FGS_PROBLEM_ID / FGS_BRIEF / FGS_CRITERION / FGS_TARGET。
  * 托管竞赛不以这些环境变量为题面真源；driver 在 start 之后显式传参。
@@ -36,7 +36,7 @@ export class BootstrapError extends Error {
 const HELP = `bootstrap_project — 在 dsh / 模型回合之前把 FGS Project 种到磁盘
 
   node tools/bootstrap_project.mjs --cwd <dir> --problem-id <id> --brief <text>
-      [--criterion <text>] [--target <addr>] [--brief-file <path>] [--state-dir .fgs]
+      [--criterion <text>] [--target <addr>] [--unique-code <id>] [--brief-file <path>] [--state-dir .fgs]
 
 成功时 stdout 一行 JSON（status=seeded|already-seeded），exit 0。
 problemId 非法、缺 brief（尚未种题时）、cwd 不可写：stderr 说明 + exit 1。
@@ -71,6 +71,7 @@ function readBriefFile(filePath) {
  *   brief?: string,
  *   criterion?: string,
  *   target?: string,
+ *   uniqueCode?: string,
  *   stateDir?: string,
  * }} options
  */
@@ -107,6 +108,7 @@ export function bootstrapProject(options = {}) {
   const brief = hasText(options.brief) ? String(options.brief) : '';
   const criterion = hasText(options.criterion) ? String(options.criterion).trim() : '';
   const target = hasText(options.target) ? String(options.target).trim() : '';
+  const uniqueCode = hasText(options.uniqueCode) ? String(options.uniqueCode).trim() : '';
 
   let existed = false;
   try {
@@ -188,7 +190,14 @@ export function bootstrapProject(options = {}) {
   const graphPath = store.graphPath;
   const competitionPath = registry.indexPath;
 
-  const content = target ? JSON.stringify({ target, brief }, null, 2) : brief;
+  let content = brief;
+  if (target || uniqueCode) {
+    const origin = {};
+    if (target) origin.target = target;
+    origin.brief = brief;
+    if (uniqueCode) origin.unique_code = uniqueCode;
+    content = JSON.stringify(origin, null, 2);
+  }
   const op = seedOriginOp({
     title: '题目信息:',
     content,
@@ -274,6 +283,11 @@ function parseArgs(argv) {
         out.target = take(arg, i);
         i += 1;
         break;
+      case '--unique-code':
+      case '--uniqueCode':
+        out.uniqueCode = take(arg, i);
+        i += 1;
+        break;
       case '--state-dir':
         out.stateDir = take(arg, i);
         i += 1;
@@ -298,6 +312,7 @@ function optionsFromArgs(args) {
     brief,
     criterion: args.criterion || process.env.FGS_CRITERION,
     target: args.target || process.env.FGS_TARGET,
+    uniqueCode: args.uniqueCode,
     stateDir: args.stateDir,
   };
 }

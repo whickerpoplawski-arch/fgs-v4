@@ -10,13 +10,15 @@
  */
 import test, { after, before } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
-import { fileURLToPath } from 'node:url';
+import { spawn, spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { Controller, GraphStore } from '../controller/index.js';
 import { WriteRejected, openStepOp, satisfyGoalOp, seedOriginOp, submitFactOp } from '../controller/ops.js';
-import { defaultFlagRegex, makeVerifyHook } from '../hooks/flag_verify.js';
+import { defaultFlagRegex, makeVerifyHook, resolveVerifyCommand } from '../hooks/flag_verify.js';
+import { load as loadYaml } from '../yaml.js';
 import { tmpDir } from './helpers.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -26,9 +28,30 @@ const COMMAND = `node ${JSON.stringify(SCRIPT)}`;
 
 let stub;
 let stubUrl;
+let hitFile;
+
+function readHits() {
+  const text = fs.readFileSync(hitFile, 'utf8').trim();
+  if (!text) return [];
+  return text.split('\n').map((line) => JSON.parse(line));
+}
+
+function hitsFor(flag) {
+  return readHits().filter((hit) => hit?.body?.flag === flag);
+}
+
+function contestVerifyConfig() {
+  const text = fs.readFileSync(path.join(HERE, '..', 'cordis.patch.yml'), 'utf8');
+  return loadYaml(text)[0].insert[0].config;
+}
 
 before(async () => {
-  stub = spawn(process.execPath, [STUB], { stdio: ['ignore', 'pipe', 'inherit'] });
+  hitFile = path.join(tmpDir('fgs-stub-hits-'), 'hits.jsonl');
+  fs.writeFileSync(hitFile, '');
+  stub = spawn(process.execPath, [STUB], {
+    stdio: ['ignore', 'pipe', 'inherit'],
+    env: { ...process.env, STUB_HIT_FILE: hitFile },
+  });
   stubUrl = await new Promise((resolve, reject) => {
     let buf = '';
     const timer = setTimeout(() => reject(new Error('stub 启动超时')), 8000);
@@ -121,6 +144,118 @@ test('§8 command 模式：fail-closed —— 缺 token / 接口不可达 / 抽�
 
 test('verifyMode 缺 verifyCommand 时构造即抛错（硬门不允许配置不全）', () => {
   assert.throws(() => makeVerifyHook({ verifyMode: 'command' }), /verifyCommand/);
+});
+
+test('verifyCommand 的 ./ 解析到插件目录，而不是 worker cwd', () => {
+  assert.equal(
+    resolveVerifyCommand('node ./tools/submit_flag.mjs', '/opt/fgs-v4'),
+    "node '/opt/fgs-v4/tools/submit_flag.mjs'",
+  );
+  assert.equal(
+    resolveVerifyCommand('node ./tools/submit_flag.mjs', '/opt/my plugin'),
+    "node '/opt/my plugin/tools/submit_flag.mjs'",
+  );
+});
+
+test('竞赛 command：mock submit 200 且 body 正确才写 satisfied*', () => {
+  const config = contestVerifyConfig();
+  assert.equal(config.verifyMode, 'command');
+  assert.equal(config.verifyCommand, 'node ./tools/submit_flag.mjs');
+  const flag = 'flag{score_ok_77}';
+  const { ctl, op, store } = graphWithFlag(flag);
+  ctl.verifyHook = makeVerifyHook({ verifyMode: 'command', verifyCommand: config.verifyCommand });
+  withEnv({
+    BENCHMARK_BASE_URL: stubUrl,
+    BENCHMARK_TOKEN: 'tok-test',
+    FGS_UNIQUE_CODE: 'a-03',
+    BENCHMARK_UNIQUE_CODE: '',
+    FGS_VERIFY_DRY_RUN: '',
+  }, () => {
+    ctl.commit(ctl.apply(op));
+  });
+  assert.ok(store.load().goals[0].satisfiedAt, '赛方 200 之后才允许写 satisfied*');
+  const hits = hitsFor(flag);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].method, 'POST');
+  assert.equal(hits[0].path, '/openapi/v1/challenges/submit');
+  assert.deepEqual(hits[0].body, { unique_code: 'a-03', flag });
+});
+
+test('竞赛 command：mock 4xx（非 409）拒绝且不写 satisfied*', () => {
+  const flag = 'flag{bad_score_9}';
+  const { ctl, op, store } = graphWithFlag(flag);
+  ctl.verifyHook = makeVerifyHook({
+    verifyMode: 'command',
+    verifyCommand: contestVerifyConfig().verifyCommand,
+  });
+  withEnv({
+    BENCHMARK_BASE_URL: stubUrl,
+    BENCHMARK_TOKEN: 'tok-test',
+    FGS_UNIQUE_CODE: 'e3-02',
+    BENCHMARK_UNIQUE_CODE: '',
+    FGS_VERIFY_DRY_RUN: '',
+  }, () => {
+    assert.throws(() => ctl.apply(op), WriteRejected);
+  });
+  assert.equal(store.load().goals[0].satisfiedAt, null);
+  const hits = hitsFor(flag);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].body.unique_code, 'e3-02');
+  assert.equal(hits[0].body.flag, flag);
+});
+
+test('竞赛 command：缺 FGS_UNIQUE_CODE 且 fact 无 unique_code 时拒绝，不 POST', () => {
+  const flag = 'flag{need_code_1}';
+  const { ctl, op, store } = graphWithFlag(flag);
+  ctl.verifyHook = makeVerifyHook({
+    verifyMode: 'command',
+    verifyCommand: contestVerifyConfig().verifyCommand,
+  });
+  const before = hitsFor(flag).length;
+  withEnv({
+    BENCHMARK_BASE_URL: stubUrl,
+    BENCHMARK_TOKEN: 'tok-test',
+    FGS_UNIQUE_CODE: '',
+    BENCHMARK_UNIQUE_CODE: '',
+    FGS_VERIFY_DRY_RUN: '',
+  }, () => {
+    assert.throws(() => ctl.apply(op), /unique_code/);
+  });
+  assert.equal(store.load().goals[0].satisfiedAt, null);
+  assert.equal(hitsFor(flag).length, before);
+});
+
+test('竞赛 verifyCommand 在非插件 cwd 下仍 POST 到 mock submit', () => {
+  const config = contestVerifyConfig();
+  const cwd = tmpDir('fgs-verify-cwd-');
+  const flag = 'flag{cwd_ok_4242}';
+  const hookUrl = pathToFileURL(path.join(HERE, '..', 'hooks', 'flag_verify.js')).href;
+  const code = [
+    `import { makeVerifyHook } from ${JSON.stringify(hookUrl)};`,
+    `const hook = makeVerifyHook({ verifyMode: 'command', verifyCommand: ${JSON.stringify(config.verifyCommand)} });`,
+    `const graph = { facts: [{ id: 'fact_001', title: 't', content: ${JSON.stringify(`got ${flag}`)} }] };`,
+    'const op = { goalId: "goal_final", reason: "r", satisfiedBy: ["fact_001"] };',
+    'const reason = hook(graph, op);',
+    'if (reason) { console.error(reason); process.exit(2); }',
+    'console.log("PASS");',
+  ].join('\n');
+  const result = spawnSync(process.execPath, ['--input-type=module', '-e', code], {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      BENCHMARK_BASE_URL: stubUrl,
+      BENCHMARK_TOKEN: 'tok-test',
+      FGS_UNIQUE_CODE: 'e2-07',
+      BENCHMARK_UNIQUE_CODE: '',
+      FGS_VERIFY_DRY_RUN: '',
+    },
+  });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const hits = hitsFor(flag);
+  assert.equal(hits.length, 1);
+  assert.equal(hits[0].path, '/openapi/v1/challenges/submit');
+  assert.deepEqual(hits[0].body, { unique_code: 'e2-07', flag });
 });
 
 test('默认 flag 正则以真实竞赛的小写 flag{...} 为准，并兼容全大写', () => {
