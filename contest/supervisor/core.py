@@ -542,12 +542,33 @@ def next_worker_dir(run: Path, code: str) -> Path:
     return dest
 
 
+def solver_child_env(unique_code: str) -> dict[str, str]:
+    """Env for one solver process.
+
+    Copies the parent so ``BENCHMARK_*`` and ``SOLVER_GATEWAY`` stay as injected.
+    Binds ``FGS_UNIQUE_CODE`` to this challenge (the same id start/close use).
+    Does not mutate ``os.environ``.
+    """
+    env = os.environ.copy()
+    code = str(unique_code or "").strip()
+    if code:
+        env["FGS_UNIQUE_CODE"] = code
+    else:
+        env.pop("FGS_UNIQUE_CODE", None)
+    return env
+
+
 def dispatch_worker(run: Path, code: str, brief: str, command: list[str] | None) -> dict:
     dest = next_worker_dir(run, code)
     (dest / "brief.txt").write_text(brief, encoding="utf-8")
     pid = None
     if command:
-        proc = subprocess.Popen(command, cwd=str(dest), start_new_session=True)
+        proc = subprocess.Popen(
+            command,
+            cwd=str(dest),
+            env=solver_child_env(code),
+            start_new_session=True,
+        )
         pid = proc.pid
         (dest / "pid").write_text(str(pid), encoding="utf-8")
     else:

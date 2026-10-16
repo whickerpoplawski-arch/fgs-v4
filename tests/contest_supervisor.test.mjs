@@ -772,3 +772,40 @@ print(json.dumps(doomed))
   const doomed = JSON.parse(probed.stdout);
   assert.deepEqual(doomed.map((item) => item.pid), [12, 13]);
 });
+
+test('dispatch_worker 子进程 environ 含本题 FGS_UNIQUE_CODE，且不改写 BENCHMARK_*', () => {
+  const scratch = tmpDir('fgs-dispatch-env-');
+  const dump = path.join(scratch, 'env.json');
+  const worker = path.join(scratch, 'dump_env.py');
+  fs.writeFileSync(worker, [
+    'import json, os',
+    `open(${JSON.stringify(dump)}, "w", encoding="utf-8").write(json.dumps({`,
+    '  "code": os.environ.get("FGS_UNIQUE_CODE"),',
+    '  "bench": os.environ.get("BENCHMARK_BASE_URL"),',
+    '  "token": os.environ.get("BENCHMARK_TOKEN"),',
+    '}))',
+    '',
+  ].join('\n'));
+  const probed = py(`
+import json, os, pathlib, time
+from supervisor.core import dispatch_worker
+os.environ["BENCHMARK_BASE_URL"] = "http://tsecbench.zc.tencent.com.tsecbench.gw"
+os.environ["BENCHMARK_TOKEN"] = "secret-token"
+os.environ["FGS_UNIQUE_CODE"] = "stale-global"
+run = pathlib.Path(${JSON.stringify(scratch)})
+result = dispatch_worker(run, "e2-04", "brief", ["python3", ${JSON.stringify(worker)}])
+dump = pathlib.Path(${JSON.stringify(dump)})
+for _ in range(50):
+    if dump.is_file():
+        break
+    time.sleep(0.05)
+child = json.loads(dump.read_text(encoding="utf-8"))
+print(json.dumps({"parent": os.environ.get("FGS_UNIQUE_CODE"), "pid": result["pid"], "child": child}))
+`);
+  assert.equal(probed.status, 0, probed.stderr);
+  const out = JSON.parse(probed.stdout);
+  assert.equal(out.parent, 'stale-global');
+  assert.equal(out.child.code, 'e2-04');
+  assert.equal(out.child.bench, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
+  assert.equal(out.child.token, 'secret-token');
+});

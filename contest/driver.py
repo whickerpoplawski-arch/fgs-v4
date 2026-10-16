@@ -13,6 +13,9 @@ Do not wait for the model to type `/fgs new` or call `fgs_project`.
 `dsh` is not vendored here. Unless CONTEST_DSH_LAUNCH=1 and `dsh` is on PATH,
 the launch step records a stub under `.fgs/dsh-launch.json`.
 
+Each solver gets ``FGS_UNIQUE_CODE`` set to that challenge's unique_code (the
+same id used for start/close). ``BENCHMARK_*`` are copied through unchanged.
+
 VPN (optional): CONTEST_VPN=1 requires CONTEST_VPN_CONFIG and CONTEST_VPN_EXEC.
 Hosted sandbox VPN presence is ambiguous (integration docs vs upload page);
 the default leaves VPN off and does not block pre-seed.
@@ -71,6 +74,7 @@ from supervisor.core import (
     plan_retire,
     read_project_meta,
     release_lock,
+    solver_child_env,
     terminate_pid,
     utc_now,
 )
@@ -492,24 +496,34 @@ def compose_brief(description: str, addrs: list[str]) -> str:
     )
 
 
-def bootstrap(cwd: Path, problem_id: str, brief: str, target: str) -> dict:
+def bootstrap(
+    cwd: Path,
+    problem_id: str,
+    brief: str,
+    target: str,
+    unique_code: str | None = None,
+) -> dict:
     if not BOOTSTRAP.is_file():
         raise DriverError(f"missing bootstrap writer: {BOOTSTRAP}")
+    argv = [
+        "node",
+        str(BOOTSTRAP),
+        "--cwd",
+        str(cwd),
+        "--problem-id",
+        problem_id,
+        "--brief",
+        brief,
+        "--target",
+        target,
+        "--criterion",
+        os.environ.get("FGS_CRITERION", DEFAULT_CRITERION),
+    ]
+    code = str(unique_code or "").strip()
+    if code:
+        argv.extend(["--unique-code", code])
     proc = subprocess.run(
-        [
-            "node",
-            str(BOOTSTRAP),
-            "--cwd",
-            str(cwd),
-            "--problem-id",
-            problem_id,
-            "--brief",
-            brief,
-            "--target",
-            target,
-            "--criterion",
-            os.environ.get("FGS_CRITERION", DEFAULT_CRITERION),
-        ],
+        argv,
         cwd=str(ROOT),
         capture_output=True,
         text=True,
@@ -540,13 +554,25 @@ def assert_seeded(cwd: Path, problem_id: str) -> None:
         raise DriverError(f"graph missing fact_origin/goal_final: {graph}")
 
 
-def launch_dsh(cwd: Path, problem_id: str, *, background: bool = False):
+def launch_dsh(
+    cwd: Path,
+    problem_id: str,
+    *,
+    unique_code: str | None = None,
+    background: bool = False,
+):
     """Start the solver in ``cwd``.
 
     Returns a ``Popen`` when ``background`` is set and a real command exists.
     The stub path writes ``.fgs/dsh-launch.json`` and returns None. The prompt
     stays a solve prompt: it does not mention reap, retire, or autosup.
+
+    The child env copies the parent (so ``BENCHMARK_*`` / ``SOLVER_GATEWAY``
+    are not rewritten) and sets ``FGS_UNIQUE_CODE`` to this challenge's id,
+    the same value start/close use. The parent environment is left unchanged.
     """
+    code = str(unique_code if unique_code is not None else problem_id).strip()
+    env = solver_child_env(code)
     prompt = cwd / "prompt.txt"
     prompt.write_text(
         "这道题的 FGS Project 已在磁盘种好（fact_origin 与 goal_final 已存在）。\n"
@@ -568,6 +594,7 @@ def launch_dsh(cwd: Path, problem_id: str, *, background: bool = False):
             str(prompt),
         ],
         "provider": "openai-completions",
+        "uniqueCode": code,
         "note": (
             "Harness is not launched unless CONTEST_DSH_LAUNCH=1 and dsh is on PATH "
             "(or CONTEST_WORKER_CMD is set). "
@@ -580,15 +607,15 @@ def launch_dsh(cwd: Path, problem_id: str, *, background: bool = False):
         marker.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         log(f"dsh launch stub for {problem_id} (set CONTEST_DSH_LAUNCH=1 when the harness is installed)")
         return None
-    log(f"launch solver cwd={cwd} background={background}")
+    log(f"launch solver cwd={cwd} background={background} unique_code={code}")
     if background:
-        proc = subprocess.Popen(command, cwd=str(cwd), start_new_session=True)
+        proc = subprocess.Popen(command, cwd=str(cwd), env=env, start_new_session=True)
         record["pid"] = proc.pid
         record["stub"] = False
         marker.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         return proc
     marker.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    subprocess.run(command, cwd=str(cwd), check=False)
+    subprocess.run(command, cwd=str(cwd), env=env, check=False)
     return None
 
 
@@ -619,9 +646,14 @@ def visit(
         cwd.mkdir(parents=True, exist_ok=True)
         brief = compose_brief(str(challenge.get("description") or ""), addrs)
         target = ", ".join(addrs)
-        seeded = bootstrap(cwd, problem_id, brief, target)
+        seeded = bootstrap(cwd, problem_id, brief, target, unique_code=raw_code)
         assert_seeded(cwd, seeded.get("problemId") or problem_id)
-        proc = launch_dsh(cwd, seeded.get("problemId") or problem_id, background=background)
+        proc = launch_dsh(
+            cwd,
+            seeded.get("problemId") or problem_id,
+            unique_code=raw_code,
+            background=background,
+        )
         log(f"visit {problem_id} {seeded.get('status')}")
         result = {
             "ok": True,

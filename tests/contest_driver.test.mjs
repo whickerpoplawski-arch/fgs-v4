@@ -535,10 +535,12 @@ test('fixture 队列预种后图存在，第二次 driver 不改 graph.yaml', ()
   assert.match(graph.goals[0].criterion, /correct=true/);
   const origin = JSON.parse(graph.facts[0].content);
   assert.equal(origin.target, 'http://10.0.0.8:8080');
+  assert.equal(origin.unique_code, 'A-10');
   assert.match(origin.brief, /示例题面/);
   assert.match(origin.brief, /container_addr: http:\/\/10\.0\.0\.8:8080/);
   const launch = JSON.parse(fs.readFileSync(path.join(cwd, '.fgs', 'dsh-launch.json'), 'utf8'));
   assert.equal(launch.stub, true);
+  assert.equal(launch.uniqueCode, 'A-10');
   assert.equal(launch.provider, 'openai-completions');
   assert.match(fs.readFileSync(path.join(cwd, 'prompt.txt'), 'utf8'), /不要调用 fgs_project/);
 
@@ -589,4 +591,68 @@ test('start 没有 container_addr 时不写 .fgs，entrypoint 缺 token/base 则
   });
   assert.notEqual(noBase.status, 0);
   assert.match(noBase.stderr, /BENCHMARK_BASE_URL/);
+});
+
+test('launch_dsh 注入本题 FGS_UNIQUE_CODE，不改写 BENCHMARK_* / SOLVER_GATEWAY', () => {
+  const scratch = tmpDir('fgs-launch-env-');
+  const worker = path.join(scratch, 'dump_env.py');
+  fs.writeFileSync(worker, [
+    'import json, os',
+    'path = os.environ["FGS_ENV_DUMP"]',
+    'open(path, "w", encoding="utf-8").write(json.dumps({',
+    '  "code": os.environ.get("FGS_UNIQUE_CODE"),',
+    '  "bench": os.environ.get("BENCHMARK_BASE_URL"),',
+    '  "token": os.environ.get("BENCHMARK_TOKEN"),',
+    '  "gateway": os.environ.get("SOLVER_GATEWAY"),',
+    '  "deepseek": os.environ.get("DEEPSEEK_BASE_URL"),',
+    '}))',
+    '',
+  ].join('\n'));
+  const script = [
+    'import json, os, pathlib, driver',
+    `scratch = pathlib.Path(${JSON.stringify(scratch)})`,
+    `worker = ${JSON.stringify(worker)}`,
+    'os.environ["BENCHMARK_BASE_URL"] = "http://tsecbench.zc.tencent.com.tsecbench.gw"',
+    'os.environ["BENCHMARK_TOKEN"] = "secret-token"',
+    'os.environ["SOLVER_GATEWAY"] = "1"',
+    'os.environ["DEEPSEEK_BASE_URL"] = "https://api.deepseek.com/v1"',
+    'os.environ["FGS_UNIQUE_CODE"] = "stale-global"',
+    'os.environ["CONTEST_WORKER_CMD"] = "python3 " + worker',
+    'def launch(name, code, background):',
+    '    cwd = scratch / name',
+    '    (cwd / ".fgs").mkdir(parents=True)',
+    '    dump = scratch / (name + ".json")',
+    '    os.environ["FGS_ENV_DUMP"] = str(dump)',
+    '    proc = driver.launch_dsh(cwd, name, unique_code=code, background=background)',
+    '    if proc is not None:',
+    '        proc.wait(timeout=10)',
+    '    marker = json.loads((cwd / ".fgs" / "dsh-launch.json").read_text(encoding="utf-8"))',
+    '    child = json.loads(dump.read_text(encoding="utf-8"))',
+    '    return {"marker": marker.get("uniqueCode"), "child": child, "returncode": None if proc is None else proc.returncode}',
+    'print(json.dumps({',
+    '  "fg": launch("fg", "A-10", False),',
+    '  "bg": launch("bg", "e1-02", True),',
+    '  "parentCode": os.environ.get("FGS_UNIQUE_CODE"),',
+    '  "parentBench": os.environ.get("BENCHMARK_BASE_URL"),',
+    '  "parentToken": os.environ.get("BENCHMARK_TOKEN"),',
+    '  "parentGateway": os.environ.get("SOLVER_GATEWAY"),',
+    '}))',
+  ].join('\n');
+  const result = runPython(['-c', script], { PYTHONPATH: path.join(repoRoot, 'contest') });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const out = JSON.parse(result.stdout);
+  assert.equal(out.parentCode, 'stale-global');
+  assert.equal(out.parentBench, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
+  assert.equal(out.parentToken, 'secret-token');
+  assert.equal(out.parentGateway, '1');
+  for (const [key, code] of [['fg', 'A-10'], ['bg', 'e1-02']]) {
+    assert.equal(out[key].marker, code);
+    assert.equal(out[key].child.code, code);
+    assert.equal(out[key].child.bench, 'http://tsecbench.zc.tencent.com.tsecbench.gw');
+    assert.equal(out[key].child.token, 'secret-token');
+    assert.equal(out[key].child.gateway, '1');
+    assert.equal(out[key].child.deepseek, 'https://api.deepseek.com/v1');
+  }
+  assert.equal(out.fg.returncode, null);
+  assert.equal(out.bg.returncode, 0);
 });
