@@ -47,14 +47,30 @@ def load_platform():
 
 def close_fn(run: Path, fixture, token, base, already: set[str]):
     def _close(code: str) -> str | None:
-        return core.perform_close(
-            run,
-            code,
-            base=base,
-            token=token,
-            fixture=fixture,
-            already=already,
-        )
+        try:
+            return core.perform_close(
+                run,
+                code,
+                base=base,
+                token=token,
+                fixture=fixture,
+                already=already,
+            )
+        except core.PlatformTransportError as exc:
+            core.append_log(run, f"close {code} failed: {exc}; pending retry")
+            print(f"contest: close {code} failed: {exc}; pending retry", file=sys.stderr)
+            return None
+        except core.SupervisorError as exc:
+            core.append_log(run, f"close {code} failed: {exc}")
+            print(f"contest: close {code} failed: {exc}", file=sys.stderr)
+            return None
+        except OSError as exc:
+            core.append_log(run, f"close {code} failed: {type(exc).__name__}: {exc}; pending retry")
+            print(
+                f"contest: close {code} failed: {type(exc).__name__}: {exc}; pending retry",
+                file=sys.stderr,
+            )
+            return None
 
     return _close
 
@@ -213,7 +229,13 @@ def cmd_autosup(_argv: list[str]) -> int:
     once = os.environ.get("CONTEST_SUPERVISOR_ONCE", "").strip().lower() in ("1", "true", "yes", "on")
     try:
         while True:
-            run_tick(run)
+            try:
+                run_tick(run)
+            except (core.PlatformTransportError, OSError) as exc:
+                # A platform timeout must not end this process. The next
+                # iteration retries close / list.
+                core.append_log(run, f"tick failed: {type(exc).__name__}: {exc}")
+                print(f"contest: tick failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             if once:
                 return 0
             time.sleep(interval)
@@ -231,6 +253,7 @@ def main(argv: list[str]) -> int:
         return 2 if not argv else 0
     command, rest = argv[0], argv[1:]
     try:
+        core.http_timeout(20)
         if command == "reap":
             return cmd_reap(rest)
         if command == "retire":
