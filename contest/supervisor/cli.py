@@ -209,7 +209,7 @@ def cmd_autosup(_argv: list[str]) -> int:
         core.acquire_lock(run)
     except core.SupervisorError as exc:
         return fail(str(exc))
-    interval = float(os.environ.get("CONTEST_SUPERVISOR_INTERVAL", "60") or "60")
+    interval = float(os.environ.get("CONTEST_SUPERVISOR_INTERVAL", "20") or "20")
     once = os.environ.get("CONTEST_SUPERVISOR_ONCE", "").strip().lower() in ("1", "true", "yes", "on")
     try:
         while True:
