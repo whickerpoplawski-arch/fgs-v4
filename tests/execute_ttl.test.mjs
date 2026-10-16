@@ -259,7 +259,7 @@ test('有非 deferred 题时不自动切到 deferred，也不自动认领', asyn
   assert.match(status.text, /next=beta/);
   assert.match(status.text, /不自动认领\/切换到 deferred/);
   assert.doesNotMatch(status.text, /next=alpha/);
-  assert.match(status.text, /deferred alpha schedule=later/);
+  assert.match(status.text, /deferred alpha schedule=stopped/);
   assert.equal(metaOf(cwd, 'alpha').state, 'deferred');
   assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
   assert.equal(graphOf(cwd, 'beta').facts.some((fact) => fact.kind === 'unfinished'), false);
@@ -267,7 +267,7 @@ test('有非 deferred 题时不自动切到 deferred，也不自动认领', asyn
   const list = fgs('list');
   assert.equal(activeId(cwd), 'beta', 'list 不得把活动题改到 deferred');
   assert.match(list.text, /next=beta/);
-  assert.match(list.text, /alpha .*schedule=later/);
+  assert.match(list.text, /alpha .*schedule=stopped/);
   assert.match(list.text, /\* beta/);
   assert.doesNotMatch(list.text, /next=alpha/);
 
@@ -281,24 +281,32 @@ test('有非 deferred 题时不自动切到 deferred，也不自动认领', asyn
   assert.doesNotMatch(ctx, /next=alpha/);
   assert.match(ctx, /未完成 Fact/);
 
+  const before = graphOf(cwd, 'alpha');
   const opened = await host.callTool('fgs_commit', {
     operations: [{ op: 'open_step', action: '不该自动认领', from: ['fact_origin'] }],
   }, agent);
-  assert.equal(opened.ok, true, opened.text);
-  assert.match(opened.text, /不自动认领/);
-  assert.match(opened.text, /优先 beta/);
-  const extra = graphOf(cwd, 'alpha').steps.find((step) => step.action === '不该自动认领');
-  assert.ok(extra);
-  assert.equal(extra.owner, null);
-  assert.equal(extra.state, 'open');
+  assert.equal(opened.ok, false, opened.text);
+  assert.match(opened.text, /deferred/);
+  assert.equal(graphOf(cwd, 'alpha').steps.length, before.steps.length);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
   assert.equal(activeId(cwd), 'alpha');
+  assert.equal(agent.concluded, false, '还有 beta 可做，不得结束整个会话');
 
   const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, true, claimed.text);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, 'sess-a');
+  assert.equal(claimed.ok, false, claimed.text);
+  assert.match(claimed.text, /deferred/);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
+
+  fgs('switch beta');
+  const betaOpen = await host.callTool('fgs_commit', {
+    operations: [{ op: 'open_step', action: '做 beta', from: ['fact_origin'] }],
+  }, agent);
+  assert.equal(betaOpen.ok, true, betaOpen.text);
+  assert.equal(graphOf(cwd, 'beta').steps[0].owner, 'sess-a');
+  assert.equal(agent.concluded, false);
 });
 
-test('只剩 deferred 题时收尾调度允许认领', async () => {
+test('只剩 deferred 题时不再认领，并请求结束会话', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -311,16 +319,19 @@ test('只剩 deferred 题时收尾调度允许认领', async () => {
   assert.equal(activeId(cwd), 'alpha');
   assert.match(status.text, /next=alpha/);
   assert.match(status.text, /wave=cleanup/);
-  assert.match(status.text, /允许收尾调度/);
+  assert.match(status.text, /Execute 已停止/);
+  assert.equal(agent.concluded, true);
   const list = fgs('list');
-  assert.match(list.text, /schedule=now/);
-  assert.match(list.text, /允许收尾调度/);
+  assert.match(list.text, /schedule=stopped/);
+  assert.match(list.text, /Execute 已停止/);
   const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, true, claimed.text);
-  assert.match(claimed.text, /Execute/);
+  assert.equal(claimed.ok, false, claimed.text);
+  assert.match(claimed.text, /deferred/);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
 });
 
-test('再进入 Execute 时 TTL 重置，未满新窗口不重复 settle', async () => {
+test('deferred 后不能再进入 Execute，二次刷新不改 meta、不追加 Fact', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -330,29 +341,25 @@ test('再进入 Execute 时 TTL 重置，未满新窗口不重复 settle', async
   await openOwned(host, agent, '第一次');
   clock.now += TTL;
   await host.callTool('fgs_status', {}, agent);
-  assert.equal(graphOf(cwd, 'alpha').facts.filter((fact) => fact.kind === 'unfinished').length, 1);
+  const meta = metaOf(cwd, 'alpha');
+  const factIds = graphOf(cwd, 'alpha').facts.map((fact) => fact.id);
+  assert.equal(factIds.filter((id) => id !== 'fact_origin').length, 1);
 
   const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, true, claimed.text);
-  const back = await host.callTool('fgs_status', {}, agent);
-  assert.match(back.text, /Execute/);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, 'sess-a');
-  assert.equal(graphOf(cwd, 'alpha').facts.filter((fact) => fact.kind === 'unfinished').length, 1);
-
-  clock.now += TTL - 1;
+  assert.equal(claimed.ok, false, claimed.text);
+  assert.match(claimed.text, /deferred/);
+  assert.match(claimed.text, /execute_timeout/);
+  clock.now += TTL;
   await host.callTool('fgs_status', {}, agent);
-  assert.equal(graphOf(cwd, 'alpha').facts.filter((fact) => fact.kind === 'unfinished').length, 1);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, 'sess-a');
-
-  clock.now += 1;
-  await host.callTool('fgs_status', {}, agent);
-  const facts = graphOf(cwd, 'alpha').facts.filter((fact) => fact.kind === 'unfinished');
-  assert.equal(facts.length, 2);
+  const again = metaOf(cwd, 'alpha');
+  assert.equal(again.state, 'deferred');
+  assert.equal(again.deferredAt, meta.deferredAt);
+  assert.equal(again.deferredReason, 'execute_timeout');
+  assert.equal(again.unfinishedFactId, meta.unfinishedFactId);
+  assert.deepEqual(graphOf(cwd, 'alpha').facts.map((fact) => fact.id), factIds);
   assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
   assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].linkedUnfinishedFactId, facts[1].id);
-  assert.equal(metaOf(cwd, 'alpha').state, 'deferred');
-  assert.equal(metaOf(cwd, 'alpha').unfinishedFactId, facts[1].id);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].id, 'step_001');
 });
 
 test('stepLeaseMs 仍拦住租约内的接手；execute TTL 释放认领不必等租约', async () => {
@@ -380,6 +387,8 @@ test('stepLeaseMs 仍拦住租约内的接手；execute TTL 释放认领不必�
   assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
   assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
   const took = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, bob);
-  assert.equal(took.ok, true, took.text);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, 'sess-b');
+  assert.equal(took.ok, false, took.text);
+  assert.match(took.text, /deferred/);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].id, 'step_001');
 });

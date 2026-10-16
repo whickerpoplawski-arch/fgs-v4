@@ -103,7 +103,14 @@ export function makeFakeHost() {
 
   const invokeGuard = (name, args, agent) => {
     for (const guard of guards) {
-      const verdict = guard({ name, arguments: args, agent });
+      const verdict = guard({
+        name,
+        arguments: args,
+        agent,
+        concludeTurn() {
+          if (agent) agent.concluded = true;
+        },
+      });
       if (typeof verdict === 'string' && verdict !== '') return verdict;
     }
     return null;
