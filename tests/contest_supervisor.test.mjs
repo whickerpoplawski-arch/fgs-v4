@@ -506,7 +506,8 @@ test('CONTEST_SUPERVISOR=0 不启循环；默认开启且 entrypoint 不拉起 a
   assert.equal(off.status, 0, off.stderr);
   assert.match(off.stderr, /supervisor off/);
   assert.doesNotMatch(off.stderr, /supervisor tick/);
-  assert.equal(fs.existsSync(path.join(workdir, 'a-10', '.fgs', 'projects', 'a-10', 'graph.yaml')), true);
+  assert.equal(fs.existsSync(path.join(workdir, 'a-10', 'prompt.txt')), true);
+  assert.equal(fs.existsSync(path.join(workdir, 'a-10', '.fgs', 'projects', 'a-10', 'graph.yaml')), false);
 
   const onDir = path.join(scratch, 'work-on');
   const on = run('python3', [driver], baseEnv({
@@ -606,8 +607,9 @@ test('driver 循环：worker 进程退出后 close 一次；deferred 超宽限�
   const notes = closeNotes(path.join(scratch, 'dead-run'));
   assert.equal(notes.filter((item) => item.code === 'gone-1').length, 1);
   const prompt = fs.readFileSync(path.join(deadWork, 'gone-1', 'prompt.txt'), 'utf8');
-  assert.match(prompt, /不要调用 fgs_project/);
-  assert.doesNotMatch(prompt, /reap|retire|autosup/);
+  assert.match(prompt, /自主渗透 Solver/);
+  assert.match(prompt, /benchmark_get_progress/);
+  assert.doesNotMatch(prompt, /fgs_project|reap|retire|autosup/);
 
   const script = path.join(scratch, 'worker.sh');
   fs.writeFileSync(script, `#!/bin/sh

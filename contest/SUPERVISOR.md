@@ -35,7 +35,12 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_RETIRE_GRACE_SOLVED` | `30` |
 | `CONTEST_SUPERVISOR_INTERVAL` | `20` |
 | `CONTEST_HTTP_TIMEOUT` | 不设时 close 为 20、driver 的 list/start 为 30。设置后三者共用，且必须是正数 |
-| `FGS_UNIQUE_CODE` | driver 按题注入 | 与 start/close 的 `unique_code` 相同。不要在上传页设成一个全局值。缺了则 `submit_flag.mjs` fail-closed，SCORE 不涨 |
+| `FGS_UNIQUE_CODE` | driver 按题注入 | 与 start/close 的 `unique_code` 相同。不要在上传页设成一个全局值。缺了则 FGS `submit_flag.mjs` fail-closed。baseline 的 `benchmark_submit_flag` 同样只认这个子进程值和本题 meta，不认 `BENCHMARK_UNIQUE_CODE` |
+| `CONTEST_DSH_PROFILE` | `contest-baseline` | 未到 `CONTEST_FGS_AFTER_SEC` 时新 worker 的 profile。无 FGS bundle |
+| `CONTEST_DSH_PROFILE_FGS` | `contest` | 到点之后**新** worker 的 profile。含 FGS。不改已经在跑的 worker |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | 从 driver 进程启动起算的秒数。`0` 立刻全用 FGS profile。负数或 `off` / `never` / `false` / `no` 则一直用 baseline。不热挂载，也不为切换杀进程 |
+| `CONTEST_SKIP_FGS_SEED` | `auto` | `auto`：只有 FGS profile 预种图。`1` 一律不预种。`0` 一律预种 |
+| `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书里的「本题时间预算」分钟数。平台字段优先 |
 
 `CONTEST_SUPERVISOR_INTERVAL` 是 driver 循环和手动 `autosup` 两轮之间的休眠秒数。`0` 仍合法（不休眠）。别名 `GRACE` / `GRACE_SOLVED` 仍覆盖对应的 `CONTEST_RETIRE_*`。
 
@@ -53,9 +58,13 @@ CONTEST_RETIRE_GRACE=60
 CONTEST_RETIRE_GRACE_SOLVED=30
 CONTEST_SUPERVISOR_INTERVAL=20
 CONTEST_DSH_LAUNCH=1
+CONTEST_DSH_PROFILE=contest-baseline
+CONTEST_DSH_PROFILE_FGS=contest
+CONTEST_FGS_AFTER_SEC=7200
 SOLVER_GATEWAY=1
-# + BENCHMARK_TOKEN / BENCHMARK_BASE_URL / 模型 key（运行时注入，勿进镜像）
-# profile：openai-completions（勿用会丢 function_call 的 responses 流）
+DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
+# + BENCHMARK_TOKEN / BENCHMARK_BASE_URL / DEEPSEEK_API_KEY（运行时注入，勿进镜像）
+# 协议：stock Messages（deepseek-official）。不要把该 id patch 成 openai-completions。
 ```
 
 解题 prompt 不包含这些脚本。监管只动进程和槽位，不改题目内容。

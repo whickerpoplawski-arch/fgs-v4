@@ -56,7 +56,8 @@ export const PLUGIN_GENERATION = 12;
  */
 export const BUILD_TAG = '12+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
-  + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt';
+  + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt'
+  + '+benchmark-allow';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -191,12 +192,20 @@ const PLAN_CONTROL_TOOLS = [
   'update_goal',
 ];
 
+/** One-hop Challenges tools. Decide must not block them on the FGS profile. */
+const BENCHMARK_TOOLS = [
+  'benchmark_get_progress',
+  'benchmark_submit_flag',
+  'record_observation',
+];
+
 const DEFAULT_DECIDE_ALLOW_TOOLS = [
   ...PLAN_CONTROL_TOOLS,
   ...READONLY_CONTROL_TOOLS,
   'cordis_inspect_list',
   'cordis_inspect_query',
   ...EGRESS_TOOLS,
+  ...BENCHMARK_TOOLS,
 ];
 
 const DEFAULT_CONFIG = Object.freeze({
@@ -253,6 +262,7 @@ const FGS_RULES = [
   '角色由图的 open step 自动决定，工具集随之切换（越权调用在 dispatch 层被硬拒）：',
   '- 本会话**没有被派发到的**（owner ≠ 本会话的）open step → Decide：只做规划/改图，禁止环境执行工具，',
   '  包括 bash/read/write/edit/glob/grep 以及 web_fetch/web_search/subagent/workflow。',
+  '  竞赛交分工具 benchmark_get_progress / benchmark_submit_flag / record_observation 在 Decide 与 Execute 都放行，直接打 Challenges API，不必先 fgs_satisfy_goal。',
   `  出站/汇报类工具（${EGRESS_TOOLS.join(' / ')}）**两类活动都放行**：`,
   '  它们只搬运已产出的信息、不能执行环境动作；因此收束完最后一个 step 后仍可向父会话回报结果。',
   '  ★ 用 structured_output 交结构化结果之前，必须先用 fgs_commit 把本轮图改动落盘（草稿或 operations[] 均可；Decide 轮不得调用 fgs_submit_fact / fgs_commit_step，角色隔离会硬拒）：宿主记录结构化输出后即视本 run 结束，其后的工具调用不会执行，未落盘的规划会静默丢失。',

@@ -1,0 +1,34 @@
+# contest (FGS on): same stock Messages route as contest-baseline.
+# Provider id deepseek-official is the built-in Messages route on llm-deepseek.
+# Do NOT redeclare that id under llm-pi-ai, and NEVER set it to openai-completions.
+# A second declaration is dropped ("already declared"); the request stays on
+# Messages and a chat /v1 root returns HTTP 404.
+# Messages root is https://api.deepseek.com/anthropic (the client appends /v1/messages).
+# SOLVER_GATEWAY=1 rewrites this baseURL host only. BENCHMARK_* is not a model URL.
+# apiKeyEnv resolves at runtime from the upload page. Do not bake the key.
+# thinking is off so solve turns are not spent on reasoning traces.
+# If a later harness rejects Messages together with the FGS bundle, do not
+# silently point this profile back at deepseek-official + openai-completions.
+# Use a new id (deepseek-contest) for any completions fallback, and say so.
+- id: agent-default-model
+  config:
+    provider: deepseek-official
+    model: deepseek-flash
+
+- id: llm-deepseek
+  config:
+    apiKeyEnv: DEEPSEEK_API_KEY
+    baseURL: https://api.deepseek.com/anthropic
+    thinking: disabled
+    reasoningEffort: off
+
+# Hosted has no approval channel. danger-full-access runs bash without bwrap
+# Landlock and without asking (policy: never). DSH_PERMISSION_MODE is the
+# primary switch; these rows pin the same defaults if the platform clears env.
+- id: sandbox-policy
+  config:
+    mode: danger-full-access
+
+- id: approval
+  config:
+    policy: never

@@ -223,10 +223,14 @@ test('F1-c：逐个枚举真实 DEFAULT_DENIED_ENV_TOOLS，Decide 轮一个都�
   assert.equal(typeof stranger.denied, 'string');
 });
 
-test('F1-d：与 v3 基线对比，只有白名单/出站各多一个 structured_output；硬拒清单不得变化（F5 已回退）', async () => {
-  // allow：只允许新增 structured_output（跟着 EGRESS 走），不得顺手放宽别的工具
-  assert.deepEqual(setDiff(V4_ALLOW, V3_ALLOW), ['structured_output'],
-    `白名单相对 v3 多出的项不止 structured_output：${setDiff(V4_ALLOW, V3_ALLOW).join(', ')}`);
+test('F1-d：与 v3 基线对比，白名单只多 structured_output 与竞赛 benchmark 三工具；硬拒清单不得变化（F5 已回退）', async () => {
+  // allow：structured_output 跟着 EGRESS；benchmark_* 是竞赛一跳交分，Decide 也要放行。
+  // 不得再顺手放宽别的工具。
+  assert.deepEqual(
+    [...setDiff(V4_ALLOW, V3_ALLOW)].sort(),
+    ['benchmark_get_progress', 'benchmark_submit_flag', 'record_observation', 'structured_output'],
+    `白名单相对 v3 的增量不对：${setDiff(V4_ALLOW, V3_ALLOW).join(', ')}`,
+  );
   assert.deepEqual(setDiff(V3_ALLOW, V4_ALLOW), [],
     `白名单相对 v3 少了项（顺手收紧）：${setDiff(V3_ALLOW, V4_ALLOW).join(', ')}`);
   // egress：只允许新增 structured_output

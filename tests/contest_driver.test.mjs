@@ -341,6 +341,7 @@ try:
     except driver.DriverError as exc:
         path_only = str(exc)
     workdir = Path(tempfile.mkdtemp())
+    os.environ["CONTEST_FGS_AFTER_SEC"] = "0"
     visited = driver.visit(
         {"unique_code": "e1-02", "description": "demo", "is_completed": False},
         base=base,
@@ -518,6 +519,7 @@ test('fixture 队列预种后图存在，第二次 driver 不改 graph.yaml', ()
     SOLVER_GATEWAY: '1',
     OPENAI_BASE_URL: 'https://api.deepseek.com/v1',
     CONTEST_MAX_CONCURRENCY: '3',
+    CONTEST_FGS_AFTER_SEC: '0',
   };
   const first = runPython([driver], env);
   assert.equal(first.status, 0, `${first.stderr}\n${first.stdout}`);
@@ -541,8 +543,15 @@ test('fixture 队列预种后图存在，第二次 driver 不改 graph.yaml', ()
   const launch = JSON.parse(fs.readFileSync(path.join(cwd, '.fgs', 'dsh-launch.json'), 'utf8'));
   assert.equal(launch.stub, true);
   assert.equal(launch.uniqueCode, 'A-10');
-  assert.equal(launch.provider, 'openai-completions');
-  assert.match(fs.readFileSync(path.join(cwd, 'prompt.txt'), 'utf8'), /不要调用 fgs_project/);
+  assert.equal(launch.provider, 'deepseek-official');
+  assert.equal(launch.protocol, 'anthropic_messages');
+  assert.equal(launch.profile, 'contest');
+  assert.equal(launch.fgs, true);
+  const prompt = fs.readFileSync(path.join(cwd, 'prompt.txt'), 'utf8');
+  assert.match(prompt, /自主渗透 Solver/);
+  assert.match(prompt, /benchmark_get_progress/);
+  assert.match(prompt, /编号：A-10/);
+  assert.doesNotMatch(prompt, /fgs_project|reap|retire|autosup/);
 
   const bytes = fs.readFileSync(graphPath);
   const second = spawnSync(entrypoint, [], {
