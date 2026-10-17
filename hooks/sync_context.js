@@ -31,7 +31,7 @@ export function roleContextText({
   role, store, graph, currentStep = null, draftSummary = '', ioSpec = null,
   graphMutationTools = null, executeDeniedGraphTools = null, injectMaxChars = 24000,
   sid = null, stepLeaseMs = 0, now = Date.now(), scheduleNote = '',
-  rolePrompt = '',
+  rolePrompt = '', concludeNote = '',
 }) {
   if (!graph || !store) return '';
   const lines = [`【FGS 当前角色】${roleLabel(role)}`];
@@ -58,6 +58,7 @@ export function roleContextText({
       lines.push('goal 级工具（fgs_satisfy_goal / fgs_reopen）本轮会被拒；'
         + '图操作工具两类活动都放行。');
     }
+    if (concludeNote) lines.push(String(concludeNote));
   } else if (role === 'decide') {
     // v3（缺陷 K/L）：把「谁在持、租约是否过期」直接标在**模型真正会读的这行**上。
     // 实测教训：旧实现只给 `step_017[high]`，模型无从判断哪条能被接手；

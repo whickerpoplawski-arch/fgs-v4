@@ -240,7 +240,7 @@ docs/                       # 开发笔记：HANDOFF / V3_CHANGES / V4_CHANGES /
         executeSessionTtlMs: 600000    # 单题 Execute 墙钟，默认 10 分钟
 ```
 
-`executeSessionTtlMs` 到期：写一条未完成 Fact，释放当前 open step 的认领（step 仍 open），题目标 `deferred`。此后本题拒绝 `open_step` / `claim_step` / 重新进入 Execute 的 `commit` / 环境工具；没有其它可做题时调用宿主 `concludeTurn` 结束会话。有非 deferred 题时不自动认领/切到 deferred，也不结束会话。`stepLeaseMs`（默认 30 分钟）只是认领租约，过期后别的会话可以 `claim_step` 接手**尚未 deferred** 的 step；它不写未完成 Fact，也不被会话 TTL 替换。
+`executeSessionTtlMs` 到期：同一会话进入收束。环境工具停止，一条 Fact 经 `fgs_commit_step` 关闭当前 step，然后回到 Decide。不写未完成 Fact，step 不保持 open，题目不因此标 `deferred`。回合结束前模型没调用 `fgs_commit_step` 时，Controller 补上这一条 Fact 并关 step。`stepLeaseMs`（默认 30 分钟）只是认领租约，过期后别的会话可以 `claim_step` 接手仍 open 的 step；它不写 Fact，也不被会话 TTL 替换。
 
 FLAG 硬门**不可关闭**（`CONTRACT §8`）：`verifyMode` 没有 `none`，未识别/`none` 一律
 fail-closed 回退到 regex。要放行请把 `flagPattern` 显式设宽——让「本运行不做外部校验」

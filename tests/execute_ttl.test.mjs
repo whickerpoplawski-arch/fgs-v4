@@ -138,7 +138,7 @@ test('release_step 拒绝空 Fact；step 保持 open，同 owner 的其它 step 
   assert.equal(again.facts.length, loaded.facts.length);
 });
 
-test('未过 TTL 不 settle；过 TTL 后未完成 Fact + 释放认领 + deferred，且幂等', async () => {
+test('未过 TTL 不收束；过 TTL 进入 conclude，回合结束才落一条 Fact 并关闭 step', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -151,57 +151,52 @@ test('未过 TTL 不 settle；过 TTL 后未完成 Fact + 释放认领 + deferre
   const early = await host.callTool('fgs_status', {}, agent);
   assert.match(early.text, /Execute/);
   let graph = graphOf(cwd, 'alpha');
-  assert.equal(graph.facts.some((fact) => fact.kind === 'unfinished'), false);
+  assert.equal(graph.facts.some((fact) => fact.id !== 'fact_origin'), false);
   assert.equal(graph.steps[0].state, 'open');
   assert.equal(graph.steps[0].owner, 'sess-a');
   assert.notEqual(metaOf(cwd, 'alpha').state, 'deferred');
 
   clock.now += 1;
-  const settled = await host.callTool('fgs_status', {}, agent);
-  assert.match(settled.text, /角色: Decide/);
-  assert.match(settled.text, /未完成 Fact/);
-  assert.match(settled.text, /卡在：step_001/);
-  assert.match(settled.text, /已试：没有未提交草稿/);
-  assert.match(settled.text, /为何停：execute_session_ttl 超时/);
-  assert.match(settled.text, /wave=cleanup/);
+  const pending = await host.callTool('fgs_status', {}, agent);
+  assert.match(pending.text, /Execute/);
   graph = graphOf(cwd, 'alpha');
-  const fact = graph.facts.find((item) => item.kind === 'unfinished');
-  assert.ok(fact);
-  assert.equal(fact.producedBy, 'step_001');
   assert.equal(graph.steps[0].state, 'open');
-  assert.equal(graph.steps[0].owner, null);
-  assert.equal(graph.steps[0].claimedAt, null);
-  assert.equal(graph.steps[0].to ?? null, null);
-  assert.equal(graph.steps[0].linkedUnfinishedFactId, fact.id);
+  assert.equal(graph.steps[0].owner, 'sess-a');
+  assert.equal(graph.facts.filter((fact) => fact.id !== 'fact_origin').length, 0);
+  assert.notEqual(metaOf(cwd, 'alpha').state, 'deferred');
+  const ctx = contextOf(host, agent);
+  assert.match(ctx, /收束 conclude/);
+  assert.match(ctx, /fgs_commit_step/);
+
+  host.emit('agent/turn-stopping', { agent });
+  host.emit('agent/turn-stopping', { agent });
+  graph = graphOf(cwd, 'alpha');
+  const facts = graph.facts.filter((fact) => fact.id !== 'fact_origin');
+  assert.equal(facts.length, 1);
+  assert.equal(facts[0].kind ?? null, null);
+  assert.equal(facts[0].producedBy, 'step_001');
+  assert.match(facts[0].title, /收束/);
+  assert.match(facts[0].content, /探索时限到了/);
+  assert.equal(graph.steps[0].state, 'done');
+  assert.equal(graph.steps[0].to, facts[0].id);
+  assert.equal(graph.steps[0].linkedUnfinishedFactId ?? null, null);
   assert.equal(graph.goals[0].satisfiedAt ?? null, null);
   const meta = metaOf(cwd, 'alpha');
-  assert.equal(meta.state, 'deferred');
-  assert.equal(meta.deferredReason, 'execute_timeout');
-  assert.equal(meta.unfinishedFactId, fact.id);
-  assert.ok(meta.deferredAt);
+  assert.notEqual(meta.state, 'deferred');
+  assert.equal(meta.deferredReason ?? null, null);
   assert.equal(activeId(cwd), 'alpha');
 
-  const again = await host.callTool('fgs_status', {}, agent);
-  assert.match(again.text, /未完成 Fact/);
-  assert.equal(graphOf(cwd, 'alpha').facts.filter((item) => item.kind === 'unfinished').length, 1);
-
-  const bumped = await host.callTool('fgs_commit', {
-    operations: [{ op: 'change_step_priority', stepId: 'step_001', priority: 'low' }],
-  }, agent);
-  assert.equal(bumped.ok, true, bumped.text);
-  assert.equal(metaOf(cwd, 'alpha').state, 'deferred');
-  assert.equal(graphOf(cwd, 'alpha').steps[0].linkedUnfinishedFactId, fact.id);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
-
+  const settled = await host.callTool('fgs_status', {}, agent);
+  assert.match(settled.text, /Decide/);
+  assert.equal(graphOf(cwd, 'alpha').facts.filter((fact) => fact.id !== 'fact_origin').length, 1);
   const http = await callRoute(host.routes[0], '/fgs/state?problemId=alpha');
-  assert.equal(http.json.deferred, true);
-  assert.equal(http.json.deferredReason, 'execute_timeout');
-  assert.equal(http.json.unfinishedFactId, fact.id);
-  assert.equal(http.json.steps[0].owner, null);
-  assert.equal(http.json.steps[0].linkedUnfinishedFactId, fact.id);
+  assert.equal(http.json.deferred, false);
+  assert.equal(http.json.role, 'decide');
+  assert.equal(http.json.steps[0].state, 'done');
+  assert.equal(agent.concluded, false);
 });
 
-test('回合收口钩子在 TTL 后写未完成 Fact（含草稿），不把 step 收成 done', async () => {
+test('回合收口在 conclude 用草稿落一条 Fact 并关闭 step，且幂等', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -220,28 +215,21 @@ test('回合收口钩子在 TTL 后写未完成 Fact（含草稿），不把 ste
   host.emit('agent/turn-stopping', { agent });
 
   const graph = graphOf(cwd, 'alpha');
-  const facts = graph.facts.filter((item) => item.kind === 'unfinished');
+  const facts = graph.facts.filter((item) => item.id !== 'fact_origin');
   assert.equal(facts.length, 1);
-  assert.match(facts[0].content, /卡在：step_001/);
-  assert.match(facts[0].content, /已试：扫到 22 端口/);
+  assert.equal(facts[0].kind ?? null, null);
+  assert.equal(facts[0].title, '扫到 22 端口');
   assert.match(facts[0].content, /nmap 只看到 ssh/);
-  assert.match(facts[0].content, /为何停：execute_session_ttl 超时/);
-  assert.equal(graph.steps[0].state, 'open');
-  assert.equal(graph.steps[0].owner, null);
-  assert.equal(graph.steps[0].linkedUnfinishedFactId, facts[0].id);
-  assert.doesNotMatch(facts[0].content, /无有效产出|回合结束前没有/);
-  assert.equal(metaOf(cwd, 'alpha').state, 'deferred');
-
+  assert.equal(graph.steps[0].state, 'done');
+  assert.equal(graph.steps[0].to, facts[0].id);
+  assert.notEqual(metaOf(cwd, 'alpha').state, 'deferred');
   const status = await host.callTool('fgs_status', {}, agent);
-  assert.equal(graphOf(cwd, 'alpha').facts.filter((item) => item.kind === 'unfinished').length, 1);
+  assert.match(status.text, /Decide/);
   assert.doesNotMatch(status.text, /草稿:/);
-  const ctx = contextOf(host, agent);
-  assert.match(ctx, /未完成 Fact/);
-  assert.match(ctx, /nmap 只看到 ssh/);
-  assert.match(ctx, /wave=cleanup/);
+  assert.equal(graphOf(cwd, 'alpha').facts.filter((item) => item.id !== 'fact_origin').length, 1);
 });
 
-test('有非 deferred 题时不自动切到 deferred，也不自动认领', async () => {
+test('TTL 收束后仍停在本题，可以再开 step，不结束会话', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -253,49 +241,20 @@ test('有非 deferred 题时不自动切到 deferred，也不自动认领', asyn
   fgs('switch alpha');
 
   clock.now += TTL;
-  const status = await host.callTool('fgs_status', {}, agent);
-  assert.equal(activeId(cwd), 'beta');
-  assert.match(status.text, /Project: beta/);
-  assert.match(status.text, /next=beta/);
-  assert.match(status.text, /不自动认领\/切换到 deferred/);
-  assert.doesNotMatch(status.text, /next=alpha/);
-  assert.match(status.text, /deferred alpha schedule=stopped/);
-  assert.equal(metaOf(cwd, 'alpha').state, 'deferred');
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
-  assert.equal(graphOf(cwd, 'beta').facts.some((fact) => fact.kind === 'unfinished'), false);
-
-  const list = fgs('list');
-  assert.equal(activeId(cwd), 'beta', 'list 不得把活动题改到 deferred');
-  assert.match(list.text, /next=beta/);
-  assert.match(list.text, /alpha .*schedule=stopped/);
-  assert.match(list.text, /\* beta/);
-  assert.doesNotMatch(list.text, /next=alpha/);
-
-  const switched = fgs('switch alpha');
-  assert.equal(switched.kind, 'success');
+  host.emit('agent/turn-stopping', { agent });
   assert.equal(activeId(cwd), 'alpha');
-  const ctx = contextOf(host, agent);
-  assert.equal(activeId(cwd), 'alpha', '上下文不得自动切到别的题，也不得改回');
-  assert.match(ctx, /next=beta/);
-  assert.match(ctx, /不自动认领\/切换/);
-  assert.doesNotMatch(ctx, /next=alpha/);
-  assert.match(ctx, /未完成 Fact/);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'done');
+  assert.notEqual(metaOf(cwd, 'alpha').state, 'deferred');
+  assert.equal(graphOf(cwd, 'beta').steps.length, 0);
+  assert.equal(agent.concluded, false);
 
-  const before = graphOf(cwd, 'alpha');
   const opened = await host.callTool('fgs_commit', {
-    operations: [{ op: 'open_step', action: '不该自动认领', from: ['fact_origin'] }],
+    operations: [{ op: 'open_step', action: '下一刀', from: ['fact_001'] }],
   }, agent);
-  assert.equal(opened.ok, false, opened.text);
-  assert.match(opened.text, /deferred/);
-  assert.equal(graphOf(cwd, 'alpha').steps.length, before.steps.length);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
+  assert.equal(opened.ok, true, opened.text);
+  assert.equal(graphOf(cwd, 'alpha').steps[1].state, 'open');
+  assert.equal(graphOf(cwd, 'alpha').steps[1].owner, 'sess-a');
   assert.equal(activeId(cwd), 'alpha');
-  assert.equal(agent.concluded, false, '还有 beta 可做，不得结束整个会话');
-
-  const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, false, claimed.text);
-  assert.match(claimed.text, /deferred/);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
 
   fgs('switch beta');
   const betaOpen = await host.callTool('fgs_commit', {
@@ -306,7 +265,7 @@ test('有非 deferred 题时不自动切到 deferred，也不自动认领', asyn
   assert.equal(agent.concluded, false);
 });
 
-test('只剩 deferred 题时不再认领，并请求结束会话', async () => {
+test('只剩一道题时 TTL 收束回 Decide，不请求结束会话', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -315,23 +274,16 @@ test('只剩 deferred 题时不再认领，并请求结束会话', async () => {
   await seedProject(host, agent, fgs, 'alpha', 'alpha-brief');
   await openOwned(host, agent, '只剩这题');
   clock.now += TTL;
+  host.emit('agent/turn-stopping', { agent });
   const status = await host.callTool('fgs_status', {}, agent);
+  assert.match(status.text, /Decide/);
+  assert.equal(agent.concluded, false);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'done');
+  assert.notEqual(metaOf(cwd, 'alpha').state, 'deferred');
   assert.equal(activeId(cwd), 'alpha');
-  assert.match(status.text, /next=alpha/);
-  assert.match(status.text, /wave=cleanup/);
-  assert.match(status.text, /Execute 已停止/);
-  assert.equal(agent.concluded, true);
-  const list = fgs('list');
-  assert.match(list.text, /schedule=stopped/);
-  assert.match(list.text, /Execute 已停止/);
-  const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, false, claimed.text);
-  assert.match(claimed.text, /deferred/);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
 });
 
-test('deferred 后不能再进入 Execute，二次刷新不改 meta、不追加 Fact', async () => {
+test('conclude 收束后二次刷新不追加 Fact、不改成 deferred', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -340,29 +292,22 @@ test('deferred 后不能再进入 Execute，二次刷新不改 meta、不追加 
   await seedProject(host, agent, fgs, 'alpha', 'alpha-brief');
   await openOwned(host, agent, '第一次');
   clock.now += TTL;
-  await host.callTool('fgs_status', {}, agent);
+  host.emit('agent/turn-stopping', { agent });
   const meta = metaOf(cwd, 'alpha');
   const factIds = graphOf(cwd, 'alpha').facts.map((fact) => fact.id);
   assert.equal(factIds.filter((id) => id !== 'fact_origin').length, 1);
-
-  const claimed = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, agent);
-  assert.equal(claimed.ok, false, claimed.text);
-  assert.match(claimed.text, /deferred/);
-  assert.match(claimed.text, /execute_timeout/);
   clock.now += TTL;
   await host.callTool('fgs_status', {}, agent);
+  host.emit('agent/turn-stopping', { agent });
   const again = metaOf(cwd, 'alpha');
-  assert.equal(again.state, 'deferred');
-  assert.equal(again.deferredAt, meta.deferredAt);
-  assert.equal(again.deferredReason, 'execute_timeout');
-  assert.equal(again.unfinishedFactId, meta.unfinishedFactId);
+  assert.notEqual(again.state, 'deferred');
+  assert.equal(again.deferredAt ?? null, null);
   assert.deepEqual(graphOf(cwd, 'alpha').facts.map((fact) => fact.id), factIds);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].id, 'step_001');
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'done');
+  assert.equal(meta.state, again.state);
 });
 
-test('stepLeaseMs 仍拦住租约内的接手；execute TTL 释放认领不必等租约', async () => {
+test('stepLeaseMs 在 conclude 关 step 之前仍拦住接手；关掉后不能再 claim 这条已完成的 step', async () => {
   const clock = { now: Date.now() };
   const { host, agent, cwd, fgs } = boot({
     executeSessionTtlMs: TTL,
@@ -381,14 +326,14 @@ test('stepLeaseMs 仍拦住租约内的接手；execute TTL 释放认领不必�
   clock.now += TTL;
   const stillBlocked = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, bob);
   assert.equal(stillBlocked.ok, false, stillBlocked.text);
-  assert.match(stillBlocked.text, /租约未过期/);
-
-  await host.callTool('fgs_status', {}, agent);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
+  assert.match(stillBlocked.text, /租约未过期|conclude|收束/);
   assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
+  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, 'sess-a');
+
+  host.emit('agent/turn-stopping', { agent });
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'done');
   const took = await host.callTool('fgs_claim_step', { stepId: 'step_001' }, bob);
   assert.equal(took.ok, false, took.text);
-  assert.match(took.text, /deferred/);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].owner, null);
-  assert.equal(graphOf(cwd, 'alpha').steps[0].id, 'step_001');
+  assert.doesNotMatch(took.text, /deferred/);
+  assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'done');
 });

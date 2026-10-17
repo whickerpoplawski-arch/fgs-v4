@@ -1,14 +1,10 @@
 # Deferred 之后 Execute 必须停
 
-`execute_timeout`（以及任何把 `meta.state` 写成 `deferred` 的路径）只表示这道题的 Execute 会话结束。
+`executeSessionTtlMs` 到期**不再**把题目标成 `deferred`。它让同一会话进入收束：停环境工具，一条 Fact 关闭当前 step，回到 Decide。
 
-到期时仍然：
+下面这道门只对磁盘上 `meta.state` 已经是 `deferred` 的题生效（例如旧运行留下的 meta）。
 
-- 写一条未完成 Fact，step 保持 `open`，认领释放（`owner` 清空）
-- `meta.state=deferred`，并写入 `deferredAt` 与 `deferredReason`
-- 不删除已有 fact / goal / step
-
-到期之后，这道题上的这些调用必须被拒绝，错误里带 `deferred` 和 `deferredReason`：
+deferred 题上这些调用必须被拒绝，错误里带 `deferred` 和 `deferredReason`：
 
 - `fgs_open_step`
 - `fgs_claim_step`
