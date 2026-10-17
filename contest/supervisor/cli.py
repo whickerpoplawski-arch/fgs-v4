@@ -46,7 +46,7 @@ def load_platform():
 
 
 def close_fn(run: Path, fixture, token, base, already: set[str]):
-    def _close(code: str) -> str | None:
+    def _close(code: str, retry: bool = False) -> str | None:
         try:
             return core.perform_close(
                 run,
@@ -55,6 +55,7 @@ def close_fn(run: Path, fixture, token, base, already: set[str]):
                 token=token,
                 fixture=fixture,
                 already=already,
+                retry=retry,
             )
         except core.PlatformTransportError as exc:
             core.append_log(run, f"close {code} failed: {exc}; pending retry")
@@ -84,10 +85,14 @@ def apply_reap(run, challenges, workers, codes, fixture, token, base) -> list[st
         if action["op"] == "keep":
             print(f"keep  {action['code']} (worker still alive)")
             continue
-        note = closer(action["code"])
+        retry = bool(action.get("retry"))
+        note = closer(action["code"], retry=retry)
         if note is None:
             continue
-        print(f"close {action['code']} -> {note}")
+        if retry:
+            print(f"close {action['code']} retry (still active after closed.txt)")
+        else:
+            print(f"close {action['code']} -> {note}")
         closed.append(action["code"])
     return closed
 

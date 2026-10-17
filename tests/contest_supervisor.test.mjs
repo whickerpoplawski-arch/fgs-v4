@@ -195,11 +195,14 @@ from supervisor.core import plan_reap
 challenges = [{"unique_code": "a-1", "container_status": "available"}]
 dead = [{"code": "a-1", "alive": False, "pid": None, "launched": True, "meta_state": "deferred"}]
 living = [{"code": "a-1", "alive": True, "pid": 1, "launched": True}]
+idle = [{"unique_code": "a-1", "container_status": "stopped"}]
 print(json.dumps({
   "dead": plan_reap(challenges, dead),
   "missing": plan_reap(challenges, []),
   "alive": plan_reap(challenges, living),
-  "again": plan_reap(challenges, dead, already_closed=["a-1"]),
+  "again_active": plan_reap(challenges, dead, already_closed=["a-1"]),
+  "again_idle": plan_reap(idle, dead, already_closed=["a-1"]),
+  "alive_closed": plan_reap(challenges, living, already_closed=["a-1"]),
 }))
 `);
   assert.equal(probed.status, 0, probed.stderr);
@@ -207,7 +210,9 @@ print(json.dumps({
   assert.deepEqual(body.dead, [{ op: 'close', code: 'a-1' }]);
   assert.deepEqual(body.missing, [{ op: 'close', code: 'a-1' }]);
   assert.deepEqual(body.alive, [{ op: 'keep', code: 'a-1' }]);
-  assert.deepEqual(body.again, []);
+  assert.deepEqual(body.again_active, [{ op: 'close', code: 'a-1', retry: true }]);
+  assert.deepEqual(body.again_idle, []);
+  assert.deepEqual(body.alive_closed, [{ op: 'keep', code: 'a-1' }]);
 
   const scratch = tmpDir('fgs-reap-');
   const runDir = path.join(scratch, 'run');
@@ -225,14 +230,28 @@ print(json.dumps({
 
   const second = run(reapSh, [], env);
   assert.equal(second.status, 0, second.stderr);
-  assert.doesNotMatch(second.stdout, /close a-1/);
-  assert.equal(closeNotes(runDir).length, 1);
+  assert.match(second.stdout, /close a-1 retry \(still active after closed\.txt\)/);
+  assert.equal(closeNotes(runDir).length, 2);
+  const closedText = fs.readFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'utf8');
+  assert.equal(closedText.trim().split('\n').filter((line) => line.trim() === 'a-1').length, 1);
+
+  const idleFixture = writeFixture(scratch, [
+    { unique_code: 'a-1', container_status: 'stopped', is_completed: false },
+  ]);
+  const third = run(reapSh, [], baseEnv({
+    RUN: runDir,
+    CONTEST_FIXTURE: idleFixture,
+  }));
+  assert.equal(third.status, 0, third.stderr);
+  assert.doesNotMatch(third.stdout, /close a-1/);
+  assert.equal(closeNotes(runDir).length, 2);
 
   const kept = startSleep();
   try {
     const keepDir = path.join(runDir, 'workers', 'w2_a-2');
     fs.mkdirSync(keepDir, { recursive: true });
     fs.writeFileSync(path.join(keepDir, 'pid'), `${kept.pid}\n`);
+    fs.appendFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'a-2\n');
     const keepFixture = writeFixture(scratch, [
       { unique_code: 'a-2', container_status: 'available', is_completed: false },
     ]);
@@ -247,6 +266,78 @@ print(json.dumps({
   } finally {
     stop(kept);
   }
+});
+
+test('driver：closed.txt 且仍 ACTIVE、无活 worker 时重关；传输失败不改 closed.txt', () => {
+  const scratch = tmpDir('fgs-reap-retry-');
+  const runDir = path.join(scratch, 'run');
+  fs.mkdirSync(path.join(runDir, 'attempted'), { recursive: true });
+  fs.writeFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'a-1\n');
+  const fixture = writeFixture(scratch, [
+    { unique_code: 'a-1', container_status: 'available', is_completed: false, description: 'stuck' },
+  ]);
+  const probed = py(`
+import os
+from pathlib import Path
+import driver
+
+def fake_sleep(_seconds):
+    raise SystemExit(0)
+
+driver.time.sleep = fake_sleep
+run = Path(os.environ["RUN"])
+work = Path(os.environ["CONTEST_WORKDIR"])
+driver.supervisor_loop(run, work, os.environ["BENCHMARK_TOKEN"], os.environ["BENCHMARK_BASE_URL"], os.environ["CONTEST_FIXTURE"])
+`, {
+    RUN: runDir,
+    CONTEST_WORKDIR: path.join(scratch, 'work'),
+    CONTEST_FIXTURE: fixture,
+    CONTEST_MAX_ACTIVE: '1',
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    CONTEST_FGS_MODE: 'after_sec',
+    PYTHONUNBUFFERED: '1',
+  });
+  assert.equal(probed.status, 0, probed.stderr);
+  assert.match(probed.stderr, /close a-1 retry \(still active after closed\.txt\)/);
+  assert.equal(closeNotes(runDir).filter((item) => item.code === 'a-1').length, 1);
+  assert.equal(
+    fs.readFileSync(path.join(runDir, 'attempted', 'closed.txt'), 'utf8').trim().split('\n')
+      .filter((line) => line.trim() === 'a-1').length,
+    1,
+  );
+
+  const transport = py(`
+import json
+from pathlib import Path
+from supervisor import core
+
+run = Path(${JSON.stringify(runDir)})
+code = "a-1"
+before = (run / "attempted" / "closed.txt").read_text(encoding="utf-8")
+notes_before = len((run / "monitor" / "closes.jsonl").read_text(encoding="utf-8").splitlines())
+
+def boom(*_args, **_kwargs):
+    raise core.PlatformTransportError("timed out")
+
+core.close_challenge = boom
+already = core.load_closed_set(run)
+try:
+    core.perform_close(run, code, base="http://benchmark.invalid", token="t", fixture=None, already=already, retry=True)
+    raise SystemExit("transport must raise")
+except core.PlatformTransportError as exc:
+    print(json.dumps({
+        "err": str(exc),
+        "closed": (run / "attempted" / "closed.txt").read_text(encoding="utf-8"),
+        "before": before,
+        "notes": len((run / "monitor" / "closes.jsonl").read_text(encoding="utf-8").splitlines()),
+        "notes_before": notes_before,
+    }))
+`);
+  assert.equal(transport.status, 0, transport.stderr);
+  const body = JSON.parse(transport.stdout);
+  assert.match(body.err, /timed out/);
+  assert.equal(body.closed, body.before);
+  assert.equal(body.notes, body.notes_before);
 });
 
 test('retire：deferred 且超过 GRACE → kill+close；宽限内 hold', async () => {

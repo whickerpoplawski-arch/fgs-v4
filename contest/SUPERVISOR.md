@@ -12,7 +12,7 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 
 `CONTEST_SUPERVISOR` 默认开启。循环在 driver 进程内，顺序是：
 
-1. **reap** — 容器仍是 `available` / `pending` / `stop_pending`，或本进程启动过的 worker 已经退出，且没有存活 pid → `close` 一次。有存活 pid → 留下。
+1. **reap** — 容器仍是 `available` / `pending` / `stop_pending`，或本进程启动过的 worker 已经退出，且没有存活 pid → `close` 一次。有存活 pid → 留下。`closed.txt` 里已有的 code，只要 list 仍是 ACTIVE 且没有存活 pid，每个 tick 再 POST 一次 close，并打 `close <code> retry (still active after closed.txt)`。list 已离开 ACTIVE 则不再关。传输失败不写 `closed.txt`。同一 tick 不重复关同一个 code。
 2. **retire** — 存活 worker 的 meta 是 `deferred` 或 `solved`，或平台 `is_completed`。过宽限后 `SIGTERM`，仍在则 `SIGKILL`，然后 `close`。平台已通关但 meta 还不是 `solved` 用短宽限（默认 30 秒），其余默认 60 秒。`solved`（含平台对账）会把 worker 目录归档为 `_done_*`。`on_fail` 下还可选：步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或 `CONTEST_FAIL_ON_BUDGET=1` 时墙钟超过预算。这两条打 baseline，也打「50 步 promote 之后、尚未进失败队」的 mid-FGS。只有失败队拉起的末轮（slot 标志 `from_fail_queue`）不因步数或墙钟 retire。同一 tick 先判步数上限，再判 promote：已经超过上限的只入失败队。
 3. **gc** — `monitor_sampler.sh loop` 的 `SESSION_ID` 不属于存活 worker 时杀掉。
 4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才补人。默认 `CONTEST_FGS_MODE=on_fail` 时先派未做过一遍的新题（profile `contest-baseline`，不预种）。新题没有了，才按 `failed_at` 从早到晚派失败题的二遍（profile `contest`，预种并补图），同时活着的 FGS worker 不超过 `CONTEST_FGS_MAX_ACTIVE`。`CONTEST_FGS_RETRY_LAST=1` 时，只要还有新题，这一轮就不派失败队里的 FGS。列表失败时按活跃容器已满处理，不补派，也不把题写进失败队列。Promote 不走这条补派：它只在 FGS 槽有余量时，把**已经占着的** baseline 槽换成 `pass=fgs`，不关容器，也不占用 `fgs_attempts`。空闲槽仍然先给新题。
