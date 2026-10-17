@@ -19,7 +19,7 @@ export const PLUGIN_SOURCE_KIND = `plugin:${PLUGIN_ID}`;
 export const STATE_FILE = '.fgs/light_constraint_state.json';
 
 export const L1_CONTRACT =
-  '【轻约束】工具前可见文字≤2句（假设+下一步）。第2句后立刻 tool_call，或无文字直接工具。禁止复述同一结论/writeup。收尾或「本题结束」除外。';
+  '【轻约束】≤2 visible sentences before tools (hypothesis + next step). After the 2nd sentence immediately tool_call, or skip visible text and call the tool. 禁止复述同一结论/writeup。收尾或「本题结束」除外。';
 export const L2_BREAK =
   '【环打断】你已连续重复相近步骤。换攻击面或脚本化；用 record_observation 记已排除路径。';
 export const L3_ANCHORS =
