@@ -3,8 +3,8 @@
 **计分（推荐 `CONTEST_FGS_MODE=on_fail`）：**
 
 - 新题一直用 profile `contest-baseline`：无 FGS，`benchmark_submit_flag` 一跳 `POST /openapi/v1/challenges/submit`（list 探到的前缀优先）。墙钟 `CONTEST_FGS_AFTER_SEC` **不**改变这一点。
-- 只有该题被窄定义判定为失败后，才进入 FIFO 重试队列。窄失败含：进程已死、deferred 过宽限、baseline 或 mid-FGS 步数超过 `CONTEST_CHALLENGE_MAX_STEPS`（默认关，上传写 `100`）、或可选墙钟 `CONTEST_FAIL_ON_BUDGET`。新题吃完（`CONTEST_FGS_RETRY_LAST=1`）时，按失败时间从早到晚给它开 **末轮** profile `contest`：挂 `@local/fgs-deepseek-dsh`，预种图，并用 baseline 产物补 Fact / Intent。插件仍是 `verifyMode: command`（`submit_flag.mjs`）。同一 profile 也有 `benchmark_*`。失败当下先快照再杀，然后腾槽，不立刻派 FGS 占槽。
-- 已经在跑的 baseline **不会**热挂载 FGS。上传 `CONTEST_CHALLENGE_FGS_AFTER_STEPS=50` 时，一遍旁路大于 50 且 FGS 槽有余量，会杀掉该 baseline，在同一工作目录以 `pass=fgs` 重开（promote）：不写 `failed/`，不关容器，不消耗 `fgs_attempts`。槽满则不杀，继续跑到大于 100 再入失败队。末轮（`from_fail_queue`）不受步数上限和墙钟预算 retire；做完一道再下一道靠 `CONTEST_FGS_MAX_ACTIVE=1`。mid-FGS 仍吃 100 步。deferred 宽限和 reap 仍在。
+- 只有该题被窄定义判定为失败后，才进入 FIFO 重试队列。窄失败含：进程已死、deferred 过宽限、baseline 或 mid-FGS 步数超过 `CONTEST_CHALLENGE_MAX_STEPS`（默认关，上传写 `125`）、一遍已超过 `CONTEST_CHALLENGE_FGS_AFTER_STEPS` 但 FGS 槽满（reason=`fgs_slot_busy`）、或可选墙钟 `CONTEST_FAIL_ON_BUDGET`。新题吃完（`CONTEST_FGS_RETRY_LAST=1`）时，按失败时间从早到晚给它开 **末轮** profile `contest`：挂 `@local/fgs-deepseek-dsh`，预种图，并用 baseline 产物补 Fact / Intent。插件仍是 `verifyMode: command`（`submit_flag.mjs`）。同一 profile 也有 `benchmark_*`。失败当下先快照再杀，然后腾槽，不立刻派 FGS 占槽。`RETRY_LAST=1` 只是新题还在时不 **开跑** 失败队 FGS；槽满失败仍然马上入队。
+- 已经在跑的 baseline **不会**热挂载 FGS。上传 `CONTEST_CHALLENGE_FGS_AFTER_STEPS=75`、`CONTEST_CHALLENGE_MAX_STEPS=125` 时，一遍旁路大于 75 且未超过 125、并且 FGS 槽有余量，会杀掉该 baseline，在同一工作目录以 `pass=fgs` 重开（promote）：不写 `failed/`，不关容器，不消耗 `fgs_attempts`，**不删** `.fgs/dsh_step_count`。mid-FGS 与 baseline 共用绝对上限 125（大于 125 才入失败队）。槽满则立刻失败入队（reason=`fgs_slot_busy`）：快照到 `queue/artifacts/<code>/`，杀掉 baseline，确认进程已死后入队并关容器，腾出平台槽；不写 `promote_enrich/`，不调用 `note_fgs_dispatch`。末轮（`from_fail_queue`）不受步数上限和墙钟预算 retire；做完一道再下一道靠 `CONTEST_FGS_MAX_ACTIVE=1`。deferred 宽限和 reap 仍在。
 - 二遍如果平台上该题容器还是 active 且地址还在，就复用；reap 已经 close 掉的话会再 `start`。
 - regex 只认形态不计分，禁止上赛场。
 - `CONTEST_FGS_MODE=after_sec` 是旧的墙钟兼容：到点后**新** worker 用 `contest`，失败题不重试。`off` 永不 FGS。上传不要用这两档，除非明确要退回 PR#12。
@@ -51,8 +51,8 @@ CONTEST_FGS_MODE=on_fail
 CONTEST_FGS_RETRY_LAST=1
 CONTEST_FGS_MAX_ACTIVE=1
 CONTEST_FGS_MAX_RETRIES=1
-CONTEST_CHALLENGE_FGS_AFTER_STEPS=50
-CONTEST_CHALLENGE_MAX_STEPS=100
+CONTEST_CHALLENGE_FGS_AFTER_STEPS=75
+CONTEST_CHALLENGE_MAX_STEPS=125
 CONTEST_RETIRE_GRACE=60
 CONTEST_RETIRE_GRACE_SOLVED=30
 CONTEST_SUPERVISOR_INTERVAL=20
@@ -81,8 +81,8 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 二遍并发 | 同时活着的 FGS worker 上限 |
 | `CONTEST_FGS_MAX_RETRIES` | `1` | 每题二遍次数 | 达到后写 `queue/fgs_done/<code>`，不再派 |
 | `CONTEST_FAIL_ON_BUDGET` | `0` | 可选墙钟 | `1` 时，活着的 baseline 或 mid-FGS 超过 Solver 预算仍未通关会被 retire 并入队。默认关。末轮 `from_fail_queue` 忽略 |
-| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 步数腾槽 | `0` 关。`> N` 把未通关的 baseline 或 mid-FGS retire 并入 `failed/`（恰好 N 继续跑）。上传推荐 `100`。旁路文件 `.fgs/dsh_step_count`（pre-step 次数，不是 session `pagination.total`）。缺文件不触发。末轮 `from_fail_queue` 忽略。与 `CONTEST_FAIL_ON_BUDGET` 正交 |
-| `CONTEST_CHALLENGE_FGS_AFTER_STEPS` | `0` | 步数挂插件 | `0` 关。上传推荐 `50`。一遍 `> M` 且未超过 `MAX_STEPS`、并且 `CONTEST_FGS_MAX_ACTIVE` 有余量：快照到 `queue/promote_enrich/<code>/`，杀掉 baseline，清掉同一目录的 `dsh_step_count`，以 `pass=fgs` 重开。不写 `failed/`，不关容器。槽满不杀。`MAX_STEPS<=0` 或 `AFTER>=MAX` 时关闭。与 `CONTEST_FGS_AFTER_SEC` 无关 |
+| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 步数腾槽 | `0` 关。`> N` 把未通关的 baseline 或 mid-FGS retire 并入 `failed/`（恰好 N 继续跑）。上传推荐 `125`。旁路文件 `.fgs/dsh_step_count`（pre-step 次数，不是 session `pagination.total`）。Promote 保留该文件，所以这是 baseline 加 mid-FGS 的绝对上限。缺文件不触发。末轮 `from_fail_queue` 忽略。与 `CONTEST_FAIL_ON_BUDGET` 正交 |
+| `CONTEST_CHALLENGE_FGS_AFTER_STEPS` | `0` | 步数挂插件 | `0` 关。上传推荐 `75`。一遍 `> M` 且未超过 `MAX_STEPS`、并且 `CONTEST_FGS_MAX_ACTIVE` 有余量：快照到 `queue/promote_enrich/<code>/`，杀掉 baseline，保留同一目录的 `dsh_step_count`，以 `pass=fgs` 重开。不写 `failed/`，不关容器。槽满则快照到 `queue/artifacts/<code>/`，杀掉并 `register_fail(reason=fgs_slot_busy)`，再关容器。`MAX_STEPS<=0` 或 `AFTER>=MAX` 时关闭。与 `CONTEST_FGS_AFTER_SEC` 无关 |
 | `CONTEST_SKIP_FGS_SEED` | `auto` | visit | baseline 跳过预种；FGS profile 仍预种，并在二遍补图 |
 | `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书 | 平台没有时间字段时的分钟数 |
 | `CONTEST_DSH_BIN` | `dsh` | which | |
@@ -123,9 +123,9 @@ DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
 4. **不应**出现 `configurable provider "deepseek-official" is already declared`
 5. **不应**出现 `DeepSeek Messages request failed (404)`
 6. baseline 交分应见 `[submit] … ACCEPT`，且不依赖 `fgs_satisfy_goal`
-7. 失败题（进程已死、deferred 过了 `CONTEST_RETIRE_GRACE`、baseline 或 mid-FGS 步数 `> CONTEST_CHALLENGE_MAX_STEPS`、或可选墙钟预算，且平台未通关）写入 `$RUN/queue/failed/<code>.json`。通关题不会出现在这里。超步日志是 `contest: retire <code> (steps)` 和 `contest: fail_queue steps code=<code> n=<n>`。仍有新题时不立刻派该题末轮 FGS。同一 tick 步数已超过 100 时只走这条，不 promote
-8. 一遍 `> CONTEST_CHALLENGE_FGS_AFTER_STEPS` 且 FGS 槽有余量：日志 `contest: promote <code> n=<n>`，随后 `pass=fgs`。此时没有 `failed/<code>.json`，也没有 `fgs_done`。快照在 `queue/promote_enrich/<code>/`，不在 `queue/artifacts/`。FGS 槽已满则没有这行日志，baseline pid 还在
-9. 新题队列空了之后，下一轮应见末轮 `pass=fgs`、`profile=contest`、`enrich=facts:N` 或 `enrich=empty`。该 worker 带 `from_fail_queue`，步数远超上限、墙钟超过 `CONTEST_CHALLENGE_BUDGET_MIN` 也不因 steps/budget retire。mid-FGS 超过 `MAX_STEPS` 会 retire 入队
+7. 失败题（进程已死、deferred 过了 `CONTEST_RETIRE_GRACE`、baseline 或 mid-FGS 步数 `> CONTEST_CHALLENGE_MAX_STEPS`、一遍已超过 AFTER 但 FGS 槽满、或可选墙钟预算，且平台未通关）写入 `$RUN/queue/failed/<code>.json`。通关题不会出现在这里。超步日志是 `contest: retire <code> (steps)` 和 `contest: fail_queue steps code=<code> n=<n>`。槽满日志是 `contest: retire <code> (fgs_slot_busy)` 和 `contest: fail_queue fgs_slot_busy code=<code> n=<n>`。仍有新题时不立刻派该题末轮 FGS，但槽满记录已经在 `failed/`。同一 tick 步数已超过 125 时只走 steps，不 promote
+8. 一遍 `> CONTEST_CHALLENGE_FGS_AFTER_STEPS` 且未超过 `MAX_STEPS`、FGS 槽有余量：日志 `contest: promote <code> n=<n>`，随后 `pass=fgs`。此时没有 `failed/<code>.json`，也没有 `fgs_done`。`.fgs/dsh_step_count` 还在。快照在 `queue/promote_enrich/<code>/`，不在 `queue/artifacts/`。FGS 槽已满则没有 promote 这行，baseline pid 已死，`failed/<code>.json` 的 reason 是 `fgs_slot_busy`，快照在 `queue/artifacts/<code>/`，没有 `queue/promote_enrich/<code>/`
+9. 新题队列空了之后，下一轮应见末轮 `pass=fgs`、`profile=contest`、`enrich=facts:N` 或 `enrich=empty`。该 worker 带 `from_fail_queue`，步数远超上限、墙钟超过 `CONTEST_CHALLENGE_BUDGET_MIN` 也不因 steps/budget retire。mid-FGS 超过绝对 `MAX_STEPS` 会 retire 入队。通关的 mid-FGS 不写 `failed/`，腾出的 FGS 槽给下一次 promote，或在新题队列空了之后给失败队
 10. close / list 超时只打 warn / `pending retry`，进程不退出，也 **不**因此把题送进 FGS 队列
 
 ---

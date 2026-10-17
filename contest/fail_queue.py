@@ -1,10 +1,17 @@
 """Fail-then-FGS queue.
 
 New challenges stay on the baseline profile. A challenge enters this queue
-only under the narrow fail rule (dead worker, deferred past grace, an
-optional first-pass step cap, or an optional budget retire). Disk state
-lives under ``$RUN/queue`` so a later
-tick can dispatch one FGS pass without touching other workers.
+only under the narrow fail rule (dead worker, deferred past grace, the
+absolute step cap, an FGS slot that is already full, or an optional budget
+retire). Disk state lives under ``$RUN/queue`` so a later tick can dispatch
+one FGS pass without touching other workers.
+
+``CONTEST_CHALLENGE_MAX_STEPS`` is one pre-step cap on ``.fgs/dsh_step_count``
+for the whole challenge. Promote does not clear that file, so a mid-round
+FGS keeps the baseline count and retires at the same ``N``. A fail-queue
+last round (``from_fail_queue``) ignores the cap. When no FGS slot is free,
+a baseline still inside ``(AFTER, MAX]`` is ``fgs_slot_busy``: snapshot
+``queue/artifacts/``, kill, then enqueue. It does not keep running to ``MAX``.
 """
 
 from __future__ import annotations
@@ -93,23 +100,26 @@ def fail_on_budget() -> bool:
 
 
 def challenge_max_steps() -> int:
-    """Pre-step fail cap. ``0`` disables. Upload recommendation is 100.
+    """Absolute pre-step fail cap. ``0`` disables. Upload recommendation is 125.
 
-    Compared with ``> N`` (a worker at exactly ``N`` keeps running). A
-    fail-queue last round (``from_fail_queue``) ignores this cap. A baseline
-    and a mid-round promoted FGS both take it. Orthogonal to
-    ``CONTEST_FAIL_ON_BUDGET``.
+    Compared with ``> N`` (a worker at exactly ``N`` keeps running). The
+    count is ``.fgs/dsh_step_count`` across baseline and mid-round FGS.
+    Promote must not clear that file, or the mid-round would get a fresh
+    budget. A fail-queue last round (``from_fail_queue``) ignores this cap.
+    Orthogonal to ``CONTEST_FAIL_ON_BUDGET``.
     """
     return env_int_default("CONTEST_CHALLENGE_MAX_STEPS", 0, minimum=0)
 
 
 def challenge_fgs_after_steps() -> int:
-    """Baseline pre-step count that promotes onto the FGS profile.
+    """Baseline pre-step count that asks for an FGS slot.
 
-    ``0`` disables. Upload recommendation is 50. Compared with ``> M``.
+    ``0`` disables. Upload recommendation is 75. Compared with ``> M``.
     Promote stays off when this value is ``0``, when
     ``CONTEST_CHALLENGE_MAX_STEPS`` is ``0``, or when this value is greater
     than or equal to the step cap (the fail path would always win first).
+    A free slot promotes. A full slot is ``fgs_slot_busy``, not a baseline
+    left running until the cap.
     """
     return env_int_default("CONTEST_CHALLENGE_FGS_AFTER_STEPS", 0, minimum=0)
 
@@ -578,12 +588,14 @@ def plan_steps_retire(workers, challenges, *, limit: int) -> list[dict]:
 
 
 def plan_promote(workers, challenges, *, after: int, limit: int, skip_codes: set[str] | None = None) -> list[dict]:
-    """Promote a live baseline whose steps are past ``after`` and not past ``limit``.
+    """Live baselines past ``after`` and not past ``limit``, highest sidecar first.
 
     ``after <= 0``, ``limit <= 0``, or ``after >= limit`` disables promote.
     Comparison is strict ``> after``. A worker already past ``limit`` is a
-    step fail, not a promote. Already-FGS workers and ``skip_codes`` (retired
-    this tick, including a same-tick step fail) are left alone.
+    step fail, not a promote, even when an FGS slot is free. Already-FGS
+    workers and ``skip_codes`` (retired this tick, including a same-tick
+    step fail) are left alone. The driver relaunches only as many as the
+    free FGS room and slot-busies the rest (``plan_slot_busy``).
     """
     if after <= 0 or limit <= 0 or after >= limit:
         return []
@@ -610,6 +622,26 @@ def plan_promote(workers, challenges, *, after: int, limit: int, skip_codes: set
             "step_count": steps,
         })
     actions.sort(key=lambda item: (-int(item["step_count"]), str(item["code"])))
+    return actions
+
+
+def plan_slot_busy(workers, challenges, *, after: int, limit: int, skip_codes: set[str] | None = None) -> list[dict]:
+    """Baselines past ``after``, not past ``limit``, and not already step-retired.
+
+    Same membership and order as ``plan_promote`` (highest sidecar first).
+    Each action is tagged ``reason=fgs_slot_busy``. The driver promotes a
+    prefix of this list up to the free FGS room and applies this reason to
+    the baselines that do not get a slot. ``room <= 0`` means every returned
+    action is slot-busy. Workers past ``limit`` are absent on purpose: they
+    are step retires. Mid-FGS and ``from_fail_queue`` workers are absent.
+    """
+    actions = []
+    for item in plan_promote(workers, challenges, after=after, limit=limit, skip_codes=skip_codes):
+        tagged = dict(item)
+        tagged["op"] = "slot_busy"
+        tagged["reason"] = "fgs_slot_busy"
+        tagged["state"] = "fgs_slot_busy"
+        actions.append(tagged)
     return actions
 
 

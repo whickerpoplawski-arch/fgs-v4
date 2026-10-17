@@ -32,6 +32,21 @@ function writeFixture(dir, challenges) {
   return file;
 }
 
+function pidGone(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return true;
+  }
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const state = stat.split(')').pop().trim().split(/\s+/)[0];
+    return state === 'Z' || state === 'X';
+  } catch {
+    return true;
+  }
+}
+
 function pyJson(script, env = {}) {
   const result = runPython(['-c', script], env);
   assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
@@ -681,14 +696,14 @@ print(json.dumps({
   assert.doesNotMatch(stderr, /fail_queue steps code=fgs-1/);
 });
 
-test('first pass over 100 steps frees the slot for a new challenge and does not start FGS', async () => {
+test('a baseline past 125 steps with a free FGS slot fails as steps and does not promote', async () => {
   const scratch = tmpDir('fgs-steps-live-');
   const script = path.join(scratch, 'worker.sh');
   fs.writeFileSync(script, `#!/bin/sh
 id=$(basename "$PWD")
 if [ "$id" = "over-1" ]; then
   mkdir -p .fgs
-  printf '%s\\n' 101 > .fgs/dsh_step_count
+  printf '%s\\n' 126 > .fgs/dsh_step_count
 fi
 exec sleep 120
 `);
@@ -727,8 +742,9 @@ exec sleep 120
       CONTEST_WORKER_CMD: script,
       CONTEST_FGS_MODE: 'on_fail',
       CONTEST_FGS_RETRY_LAST: '1',
-      CONTEST_CHALLENGE_MAX_STEPS: '100',
-      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '50',
+      CONTEST_CHALLENGE_MAX_STEPS: '125',
+      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '75',
+      CONTEST_FGS_MAX_ACTIVE: '1',
       CONTEST_FAIL_ON_BUDGET: '0',
       SOLVER_GATEWAY: '0',
     },
@@ -755,7 +771,7 @@ exec sleep 120
       });
     });
     assert.match(stderr, /contest: retire over-1 \(steps\)/);
-    assert.match(stderr, /contest: fail_queue steps code=over-1 n=101/);
+    assert.match(stderr, /contest: fail_queue steps code=over-1 n=126/);
     assert.match(stderr, /visit fresh-1 .* pass=first/);
     assert.doesNotMatch(stderr, /pass=fgs/);
     assert.doesNotMatch(stderr, /promote /);
@@ -788,7 +804,7 @@ test('last-round FGS ignores the step cap and the wall-clock budget', async () =
   const script = path.join(scratch, 'worker.sh');
   fs.writeFileSync(script, `#!/bin/sh
 mkdir -p .fgs
-printf '%s\\n' 500 > .fgs/dsh_step_count
+printf '%s\\n' 900 > .fgs/dsh_step_count
 exec sleep 120
 `);
   fs.chmodSync(script, 0o755);
@@ -831,8 +847,8 @@ exec sleep 120
       CONTEST_WORKER_CMD: script,
       CONTEST_FGS_MODE: 'on_fail',
       CONTEST_FGS_RETRY_LAST: '1',
-      CONTEST_CHALLENGE_MAX_STEPS: '100',
-      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '50',
+      CONTEST_CHALLENGE_MAX_STEPS: '125',
+      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '75',
       CONTEST_FAIL_ON_BUDGET: '1',
       CONTEST_SKIP_FGS_SEED: '1',
       SOLVER_GATEWAY: '0',
@@ -1033,18 +1049,31 @@ print(json.dumps({
   assert.equal(body.fgs_done, false);
 });
 
-test('promote snapshots outside queue/artifacts, clears the step file, and does not kill when the slot is full or the process survives', () => {
+test('promote at 76 keeps the step file; a full slot at 76 is fgs_slot_busy; 126 is steps', () => {
   const scratch = tmpDir('fgs-promote-kill-');
   const script = `
 import json, os, signal, subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 import driver
+from fail_queue import (
+    challenge_fgs_after_steps, challenge_max_steps, plan_promote, plan_slot_busy,
+    plan_steps_retire, register_fail,
+)
 
-os.environ["CONTEST_CHALLENGE_MAX_STEPS"] = "100"
-os.environ["CONTEST_CHALLENGE_FGS_AFTER_STEPS"] = "50"
+os.environ.pop("CONTEST_CHALLENGE_MAX_STEPS", None)
+os.environ.pop("CONTEST_CHALLENGE_FGS_AFTER_STEPS", None)
+default_max = challenge_max_steps()
+default_after = challenge_fgs_after_steps()
+os.environ["CONTEST_CHALLENGE_MAX_STEPS"] = "125"
+os.environ["CONTEST_CHALLENGE_FGS_AFTER_STEPS"] = "75"
 scratch = Path(${JSON.stringify(scratch)})
 run = scratch / "run"
 pids = []
+closed = []
+
+def note_close(code):
+    closed.append(code)
 
 def launch_slot(code, steps):
     work = scratch / code
@@ -1060,21 +1089,71 @@ def launch_slot(code, steps):
     challenge = {"unique_code": code, "is_completed": False, "container_addr": ["http://10.8.0.20"]}
     return work, proc, slot, challenge
 
+def view(code, steps, **extra):
+    base = {
+        "code": code, "alive": True, "pid": 7, "dir": str(scratch / code),
+        "meta_state": "running", "pass_kind": "first", "step_count": steps,
+    }
+    base.update(extra)
+    return base
+
 try:
-    work, proc, slot, challenge = launch_slot("p-1", 60)
+    challenges = [
+        {"unique_code": code, "is_completed": False}
+        for code in ("at75", "at76", "at125", "at126", "mid126", "last900")
+    ]
+    workers = [
+        view("at75", 75),
+        view("at76", 76),
+        view("at125", 125),
+        view("at126", 126),
+        view("mid126", 126, pass_kind="fgs", from_fail_queue=False),
+        view("last900", 900, pass_kind="fgs", from_fail_queue=True),
+    ]
+    step_codes = [item["code"] for item in plan_steps_retire(workers, challenges, limit=125)]
+    promoted = [item["code"] for item in plan_promote(workers, challenges, after=75, limit=125, skip_codes=set(step_codes))]
+    busy = plan_slot_busy(workers, challenges, after=75, limit=125, skip_codes=set(step_codes))
+    work, proc, slot, challenge = launch_slot("p-1", 76)
     held_slots = [slot]
-    plans = driver.apply_promotes(run, held_slots, [challenge], room=1, skip_codes=set())
-    full_work, full_proc, full_slot, full_challenge = launch_slot("full-1", 70)
-    full_plans = driver.apply_promotes(run, [full_slot], [full_challenge], room=0, skip_codes=set())
-    skip_work, skip_proc, skip_slot, skip_challenge = launch_slot("skip-1", 101)
-    skip_plans = driver.apply_promotes(run, [skip_slot], [skip_challenge], room=1, skip_codes={"skip-1"})
+    plans = driver.apply_promotes(run, held_slots, [challenge], room=1, skip_codes=set(), close=note_close)
+    exact_work, exact_proc, exact_slot, exact_challenge = launch_slot("exact-75", 75)
+    exact_plans = driver.apply_promotes(run, [exact_slot], [exact_challenge], room=1, skip_codes=set(), close=note_close)
+    low_work, low_proc, low_slot, low_challenge = launch_slot("low-51", 51)
+    low_plans = driver.apply_promotes(run, [low_slot], [low_challenge], room=1, skip_codes=set(), close=note_close)
+    full_work, full_proc, full_slot, full_challenge = launch_slot("full-1", 76)
+    full_held = [full_slot]
+    full_plans = driver.apply_promotes(run, full_held, [full_challenge], room=0, skip_codes=set(), close=note_close)
+    full_record = json.loads((run / "queue" / "failed" / "full-1.json").read_text())
+    again = register_fail(
+        run, unique_code="full-1", reason="steps", artifact_dir="/tmp/other",
+        now=datetime(2026, 6, 1, tzinfo=timezone.utc),
+    )
+    over_work, over_proc, over_slot, over_challenge = launch_slot("over-126", 126)
+    over_plans = driver.apply_promotes(run, [over_slot], [over_challenge], room=1, skip_codes=set(), close=note_close)
+    skip_work, skip_proc, skip_slot, skip_challenge = launch_slot("skip-1", 100)
+    skip_plans = driver.apply_promotes(run, [skip_slot], [skip_challenge], room=1, skip_codes={"skip-1"}, close=note_close)
+    hi_work, hi_proc, hi_slot, hi_challenge = launch_slot("hi-90", 90)
+    lo_work, lo_proc, lo_slot, lo_challenge = launch_slot("lo-76", 76)
+    pair_slots = [hi_slot, lo_slot]
+    pair_plans = driver.apply_promotes(
+        run, pair_slots, [hi_challenge, lo_challenge], room=1, skip_codes=set(), close=note_close,
+    )
     real_kill = driver.terminate_pid
     driver.terminate_pid = lambda *args, **kwargs: None
-    stuck_work, stuck_proc, stuck_slot, stuck_challenge = launch_slot("stuck-1", 66)
-    stuck_plans = driver.apply_promotes(run, [stuck_slot], [stuck_challenge], room=1, skip_codes=set())
+    stuck_work, stuck_proc, stuck_slot, stuck_challenge = launch_slot("stuck-1", 76)
+    stuck_plans = driver.apply_promotes(run, [stuck_slot], [stuck_challenge], room=1, skip_codes=set(), close=note_close)
+    busy_stuck_work, busy_stuck_proc, busy_stuck_slot, busy_stuck_challenge = launch_slot("busy-stuck", 76)
+    busy_stuck_plans = driver.apply_promotes(run, [busy_stuck_slot], [busy_stuck_challenge], room=0, skip_codes=set(), close=note_close)
     driver.terminate_pid = real_kill
     enrich = driver.promote_enrich_dir(run, "p-1")
     print(json.dumps({
+        "default_max": default_max,
+        "default_after": default_after,
+        "step_codes": step_codes,
+        "promoted": promoted,
+        "busy_codes": [item["code"] for item in busy],
+        "busy_reasons": sorted({item["reason"] for item in busy}),
+        "busy_tail": [item["code"] for item in busy[1:]],
         "plans": len(plans),
         "kind": plans[0]["pass_kind"],
         "promote": plans[0]["promote"],
@@ -1082,13 +1161,37 @@ try:
         "reuse": plans[0]["reuse_ok"],
         "dead": proc.poll() is not None,
         "removed": len(held_slots) == 0,
-        "step_gone": not (work / ".fgs" / "dsh_step_count").exists(),
+        "step_kept": (work / ".fgs" / "dsh_step_count").read_text().strip(),
         "marker": (enrich / ".fgs" / "baseline_marker").is_file(),
         "artifacts": (run / "queue" / "artifacts" / "p-1").exists(),
         "failed": (run / "queue" / "failed" / "p-1.json").exists(),
-        "full": len(full_plans) == 0 and full_proc.poll() is None,
+        "exact75": len(exact_plans) == 0 and exact_proc.poll() is None,
+        "low51": len(low_plans) == 0 and low_proc.poll() is None,
+        "full_plans": len(full_plans),
+        "full_dead": full_proc.poll() is not None,
+        "full_removed": len(full_held) == 0,
+        "full_reason": full_record["reason"],
+        "full_attempts": full_record["fgs_attempts"],
+        "full_at": full_record["failed_at"],
+        "full_again_at": again["failed_at"],
+        "full_again_reason": again["reason"],
+        "full_done": (run / "queue" / "first_pass_done" / "full-1").is_file(),
+        "full_marker": (run / "queue" / "artifacts" / "full-1" / ".fgs" / "baseline_marker").is_file(),
+        "full_enrich": driver.promote_enrich_dir(run, "full-1").exists(),
+        "full_fgs_done": (run / "queue" / "fgs_done" / "full-1").exists(),
+        "over": len(over_plans) == 0 and over_proc.poll() is None and not (run / "queue" / "failed" / "over-126.json").exists(),
         "skip": len(skip_plans) == 0 and skip_proc.poll() is None,
-        "stuck": len(stuck_plans) == 0 and stuck_proc.poll() is None and not driver.promote_enrich_dir(run, "stuck-1").exists(),
+        "pair_code": pair_plans[0]["code"],
+        "pair_kept": (hi_work / ".fgs" / "dsh_step_count").read_text().strip(),
+        "pair_failed": not (run / "queue" / "failed" / "hi-90.json").exists(),
+        "lo_dead": lo_proc.poll() is not None,
+        "lo_reason": json.loads((run / "queue" / "failed" / "lo-76.json").read_text())["reason"],
+        "lo_enrich": driver.promote_enrich_dir(run, "lo-76").exists(),
+        "lo_marker": (run / "queue" / "artifacts" / "lo-76" / ".fgs" / "baseline_marker").is_file(),
+        "pair_left": [item.get("code") for item in pair_slots],
+        "stuck": len(stuck_plans) == 0 and stuck_proc.poll() is None and not driver.promote_enrich_dir(run, "stuck-1").exists() and not (run / "queue" / "failed" / "stuck-1.json").exists(),
+        "busy_stuck": len(busy_stuck_plans) == 0 and busy_stuck_proc.poll() is None and not (run / "queue" / "artifacts" / "busy-stuck").exists() and not (run / "queue" / "failed" / "busy-stuck.json").exists(),
+        "closed": closed,
     }))
 finally:
     driver.terminate_pid = real_kill if "real_kill" in dir() else driver.terminate_pid
@@ -1099,6 +1202,13 @@ finally:
             pass
 `;
   const { body, stderr } = pyJson(script);
+  assert.equal(body.default_max, 0);
+  assert.equal(body.default_after, 0);
+  assert.deepEqual(body.step_codes, ['at126', 'mid126']);
+  assert.deepEqual(body.promoted, ['at125', 'at76']);
+  assert.deepEqual(body.busy_codes, ['at125', 'at76']);
+  assert.deepEqual(body.busy_reasons, ['fgs_slot_busy']);
+  assert.deepEqual(body.busy_tail, ['at76']);
   assert.equal(body.plans, 1);
   assert.equal(body.kind, 'fgs');
   assert.equal(body.promote, true);
@@ -1106,18 +1216,50 @@ finally:
   assert.equal(body.reuse, true);
   assert.equal(body.dead, true);
   assert.equal(body.removed, true);
-  assert.equal(body.step_gone, true);
+  assert.equal(body.step_kept, '76');
   assert.equal(body.marker, true);
   assert.equal(body.artifacts, false);
   assert.equal(body.failed, false);
-  assert.equal(body.full, true);
+  assert.equal(body.exact75, true);
+  assert.equal(body.low51, true);
+  assert.equal(body.full_plans, 0);
+  assert.equal(body.full_dead, true);
+  assert.equal(body.full_removed, true);
+  assert.equal(body.full_reason, 'fgs_slot_busy');
+  assert.equal(body.full_attempts, 0);
+  assert.equal(body.full_at, body.full_again_at);
+  assert.equal(body.full_again_reason, 'fgs_slot_busy');
+  assert.notEqual(body.full_at, '2026-06-01T00:00:00Z');
+  assert.equal(body.full_done, true);
+  assert.equal(body.full_marker, true);
+  assert.equal(body.full_enrich, false);
+  assert.equal(body.full_fgs_done, false);
+  assert.equal(body.over, true);
   assert.equal(body.skip, true);
+  assert.equal(body.pair_code, 'hi-90');
+  assert.equal(body.pair_kept, '90');
+  assert.equal(body.pair_failed, true);
+  assert.equal(body.lo_dead, true);
+  assert.equal(body.lo_reason, 'fgs_slot_busy');
+  assert.equal(body.lo_enrich, false);
+  assert.equal(body.lo_marker, true);
+  assert.deepEqual(body.pair_left, []);
   assert.equal(body.stuck, true);
-  assert.match(stderr, /contest: promote p-1 n=60/);
+  assert.equal(body.busy_stuck, true);
+  assert.deepEqual(body.closed, ['full-1', 'lo-76']);
+  assert.match(stderr, /contest: promote p-1 n=76/);
+  assert.match(stderr, /contest: promote hi-90 n=90/);
+  assert.match(stderr, /contest: fail_queue fgs_slot_busy code=full-1 n=76/);
+  assert.match(stderr, /contest: retire full-1 \(fgs_slot_busy\)/);
+  assert.match(stderr, /contest: retire lo-76 \(fgs_slot_busy\)/);
   assert.doesNotMatch(stderr, /fail_queue steps code=p-1/);
+  assert.doesNotMatch(stderr, /promote full-1/);
+  assert.doesNotMatch(stderr, /promote over-126/);
+  assert.doesNotMatch(stderr, /promote exact-75/);
+  assert.doesNotMatch(stderr, /promote low-51/);
 });
 
-test('a baseline past 50 steps is promoted in place, then the mid-round FGS fails at 100', async () => {
+test('promote at 76 keeps the step file, then the mid-round FGS fails at 126', async () => {
   const scratch = tmpDir('fgs-promote-live-');
   const script = path.join(scratch, 'worker.sh');
   fs.writeFileSync(script, `#!/bin/sh
@@ -1129,7 +1271,7 @@ mkdir -p .fgs
 if [ ! -f .fgs/pass_marker ]; then
   echo first > .fgs/pass_marker
   echo yes > .fgs/baseline_marker
-  printf '%s\\n' 60 > .fgs/dsh_step_count
+  printf '%s\\n' 76 > .fgs/dsh_step_count
 else
   echo second > .fgs/pass_marker
   echo yes > .fgs/mid_marker
@@ -1138,7 +1280,7 @@ else
   else
     echo step_cleared > .fgs/step_state
   fi
-  printf '%s\\n' 101 > .fgs/dsh_step_count
+  printf '%s\\n' 126 > .fgs/dsh_step_count
 fi
 exec sleep 120
 `);
@@ -1178,8 +1320,8 @@ exec sleep 120
       CONTEST_FGS_MODE: 'on_fail',
       CONTEST_FGS_RETRY_LAST: '1',
       CONTEST_FGS_MAX_ACTIVE: '1',
-      CONTEST_CHALLENGE_MAX_STEPS: '100',
-      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '50',
+      CONTEST_CHALLENGE_MAX_STEPS: '125',
+      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '75',
       CONTEST_FAIL_ON_BUDGET: '0',
       CONTEST_SKIP_FGS_SEED: '1',
       SOLVER_GATEWAY: '0',
@@ -1209,7 +1351,7 @@ exec sleep 120
       child.stderr.on('data', (chunk) => {
         stderr += chunk;
         if (
-          /promote slow-1 n=60/.test(stderr)
+          /promote slow-1 n=76/.test(stderr)
           && /retire slow-1 \(steps\)/.test(stderr)
           && /visit fresh-1 /.test(stderr)
         ) {
@@ -1229,29 +1371,32 @@ exec sleep 120
     assert.equal(fail.reason, 'steps');
     assert.equal(fail.fgs_attempts, 0);
     assert.equal(fs.existsSync(path.join(run, 'queue', 'fgs_done', 'slow-1')), false);
-    assert.equal(fs.readFileSync(path.join(workdir, 'slow-1', '.fgs', 'step_state'), 'utf8').trim(), 'step_cleared');
+    assert.equal(fs.readFileSync(path.join(workdir, 'slow-1', '.fgs', 'step_state'), 'utf8').trim(), 'step_still_present');
     assert.equal(fs.existsSync(path.join(run, 'queue', 'promote_enrich', 'slow-1', '.fgs', 'baseline_marker')), true);
     assert.equal(fs.existsSync(path.join(run, 'queue', 'promote_enrich', 'slow-1', '.fgs', 'mid_marker')), false);
     assert.equal(fs.existsSync(path.join(run, 'queue', 'artifacts', 'slow-1', '.fgs', 'mid_marker')), true);
     const passes = fs.readFileSync(path.join(workdir, 'slow-1', '.contest', 'passes.jsonl'), 'utf8');
     assert.match(passes, /"pass": "first"/);
     assert.match(passes, /"pass": "fgs"/);
-    assert.equal((stderr.match(/promote slow-1 n=60/g) || []).length, 1);
-    assert.match(stderr, /fail_queue steps code=slow-1 n=101/);
+    assert.equal((stderr.match(/promote slow-1 n=76/g) || []).length, 1);
+    assert.match(stderr, /fail_queue steps code=slow-1 n=126/);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'slow-1.json')), true);
+    assert.doesNotMatch(stderr, /fgs_slot_busy/);
     assert.match(stderr, /visit fresh-1 .* pass=first/);
   } finally {
     killTree();
   }
 });
 
-test('a full FGS slot leaves the baseline running past 50 steps', async () => {
+test('a full FGS slot at 76 slot-busies the baseline instead of keeping it', async () => {
   const scratch = tmpDir('fgs-promote-full-');
   const script = path.join(scratch, 'worker.sh');
   fs.writeFileSync(script, `#!/bin/sh
 id=$(basename "$PWD")
 mkdir -p .fgs
 if [ "$id" = "slow-1" ]; then
-  printf '%s\\n' 60 > .fgs/dsh_step_count
+  echo yes > .fgs/baseline_marker
+  printf '%s\\n' 76 > .fgs/dsh_step_count
 fi
 exec sleep 120
 `);
@@ -1273,7 +1418,7 @@ exec sleep 120
   const fixture = writeFixture(scratch, [
     {
       unique_code: 'slow-1',
-      description: 'baseline that should keep running',
+      description: 'baseline that loses the FGS slot',
       is_completed: false,
       container_addr: ['http://10.8.0.31'],
     },
@@ -1303,8 +1448,8 @@ exec sleep 120
       CONTEST_FGS_MODE: 'on_fail',
       CONTEST_FGS_RETRY_LAST: '0',
       CONTEST_FGS_MAX_ACTIVE: '1',
-      CONTEST_CHALLENGE_MAX_STEPS: '100',
-      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '50',
+      CONTEST_CHALLENGE_MAX_STEPS: '125',
+      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '75',
       CONTEST_FAIL_ON_BUDGET: '0',
       CONTEST_SKIP_FGS_SEED: '1',
       SOLVER_GATEWAY: '0',
@@ -1333,7 +1478,12 @@ exec sleep 120
       }, 15000);
       child.stderr.on('data', (chunk) => {
         stderr += chunk;
-        if (/visit slow-1 /.test(stderr) && /visit redo-1 /.test(stderr) && /pass=fgs/.test(stderr)) {
+        if (
+          /visit slow-1 /.test(stderr)
+          && /visit redo-1 /.test(stderr)
+          && /pass=fgs/.test(stderr)
+          && /fail_queue fgs_slot_busy code=slow-1 n=76/.test(stderr)
+        ) {
           clearTimeout(timer);
           resolve();
         }
@@ -1341,21 +1491,334 @@ exec sleep 120
       child.on('error', reject);
       child.on('exit', () => {
         clearTimeout(timer);
-        reject(new Error(`driver exited before both visits\n${stderr}`));
+        reject(new Error(`driver exited before slot-busy\n${stderr}`));
       });
     });
-    await new Promise((resolve) => setTimeout(resolve, 1500));
-    assert.doesNotMatch(stderr, /promote /);
-    assert.doesNotMatch(stderr, /retire slow-1/);
-    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'slow-1.json')), false);
+    const fail = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'slow-1.json'), 'utf8'));
+    assert.equal(fail.reason, 'fgs_slot_busy');
+    assert.equal(fail.fgs_attempts, 0);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'first_pass_done', 'slow-1')), true);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'artifacts', 'slow-1', '.fgs', 'baseline_marker')), true);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'promote_enrich', 'slow-1')), false);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'fgs_done', 'slow-1')), false);
+    assert.match(stderr, /contest: retire slow-1 \(fgs_slot_busy\)/);
+    assert.match(stderr, /contest: close slow-1/);
+    assert.doesNotMatch(stderr, /promote slow-1/);
     const launch = JSON.parse(fs.readFileSync(path.join(workdir, 'slow-1', '.fgs', 'dsh-launch.json'), 'utf8'));
     assert.equal(launch.pass, 'first');
     assert.equal(launch.profile, 'contest-baseline');
-    process.kill(launch.pid, 0);
+    assert.equal(pidGone(launch.pid), true);
     const redo = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'redo-1.json'), 'utf8'));
     assert.equal(redo.fgs_attempts, 1);
     assert.equal(redo.failed_at, '2026-01-01T00:00:00Z');
+    assert.equal(redo.reason, 'reap');
   } finally {
     killTree();
   }
+});
+
+function spawnSupervisor(scratch, workerSource, challenges, envExtra) {
+  const script = path.join(scratch, 'worker.sh');
+  fs.writeFileSync(script, workerSource);
+  fs.chmodSync(script, 0o755);
+  const workdir = path.join(scratch, 'work');
+  const run = path.join(scratch, 'run');
+  const fixture = writeFixture(scratch, challenges);
+  const child = spawn('python3', [driver], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: path.join(repoRoot, 'contest'),
+      PYTHONUNBUFFERED: '1',
+      BENCHMARK_TOKEN: 'test-token',
+      BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+      CONTEST_FIXTURE: fixture,
+      CONTEST_WORKDIR: workdir,
+      RUN: run,
+      CONTEST_DSH_LAUNCH: '0',
+      CONTEST_SUPERVISOR: '1',
+      CONTEST_SUPERVISOR_INTERVAL: '0',
+      CONTEST_WORKER_CMD: script,
+      CONTEST_FGS_MODE: 'on_fail',
+      CONTEST_FGS_MAX_ACTIVE: '1',
+      CONTEST_CHALLENGE_MAX_STEPS: '125',
+      CONTEST_CHALLENGE_FGS_AFTER_STEPS: '75',
+      CONTEST_FAIL_ON_BUDGET: '0',
+      CONTEST_SKIP_FGS_SEED: '1',
+      SOLVER_GATEWAY: '0',
+      ...envExtra,
+    },
+  });
+  return { child, workdir, run };
+}
+
+function killLaunches(child, workdir, codes) {
+  try {
+    child.kill('SIGKILL');
+  } catch {
+    // already gone
+  }
+  for (const code of codes) {
+    try {
+      const launch = JSON.parse(fs.readFileSync(path.join(workdir, code, '.fgs', 'dsh-launch.json'), 'utf8'));
+      if (launch.pid) process.kill(-launch.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+}
+
+test('a solved mid-FGS frees the slot so the next baseline can promote', async () => {
+  const scratch = tmpDir('fgs-solved-promote-');
+  const { child, workdir, run } = spawnSupervisor(scratch, `#!/bin/sh
+id=$(basename "$PWD")
+mkdir -p .fgs
+if [ "$id" = "mid-1" ]; then
+  if [ ! -f .fgs/pass_marker ]; then
+    echo first > .fgs/pass_marker
+    printf '%s\\n' 76 > .fgs/dsh_step_count
+  else
+    mkdir -p .fgs/projects/mid-1
+    printf '%s\\n' '{"state":"solved","updatedAt":"2000-01-01T00:00:00Z"}' > .fgs/projects/mid-1/meta.json
+  fi
+  exec sleep 120
+fi
+if [ ! -f .fgs/pass_marker ]; then
+  echo first > .fgs/pass_marker
+  printf '%s\\n' 76 > .fgs/dsh_step_count
+fi
+exec sleep 120
+`, [
+    {
+      unique_code: 'mid-1',
+      description: 'promote then solve',
+      is_completed: false,
+      container_addr: ['http://10.8.0.41'],
+    },
+    {
+      unique_code: 'wait-1',
+      description: 'promotes after the slot frees',
+      is_completed: false,
+      container_addr: ['http://10.8.0.42'],
+    },
+  ], {
+    CONTEST_MAX_ACTIVE: '1',
+    CONTEST_FGS_RETRY_LAST: '1',
+  });
+  let stderr = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for the next promote\n${stderr}`));
+      }, 15000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (/promote mid-1 n=76/.test(stderr) && /retire mid-1 \(solved\)/.test(stderr) && /promote wait-1 n=76/.test(stderr)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', () => {
+        if (!/promote wait-1 n=76/.test(stderr)) {
+          clearTimeout(timer);
+          reject(new Error(`driver exited before the next promote\n${stderr}`));
+        }
+      });
+    });
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'mid-1.json')), false);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'wait-1.json')), false);
+    assert.doesNotMatch(stderr, /fgs_slot_busy/);
+    assert.equal((stderr.match(/promote mid-1 n=76/g) || []).length, 1);
+    assert.equal((stderr.match(/promote wait-1 n=76/g) || []).length, 1);
+  } finally {
+    killLaunches(child, workdir, ['mid-1', 'wait-1']);
+  }
+});
+
+test('a solved mid-FGS frees the slot for the fail queue when no new challenge remains', async () => {
+  const scratch = tmpDir('fgs-solved-fifo-');
+  const runDir = path.join(scratch, 'run');
+  fs.mkdirSync(path.join(runDir, 'queue', 'failed'), { recursive: true });
+  fs.mkdirSync(path.join(runDir, 'queue', 'first_pass_done'), { recursive: true });
+  fs.writeFileSync(path.join(runDir, 'queue', 'failed', 'redo-1.json'), `${JSON.stringify({
+    unique_code: 'redo-1',
+    failed_at: '2026-01-01T00:00:00Z',
+    reason: 'reap',
+    artifact_dir: '',
+    attempt: 1,
+    problem_id: '',
+    fgs_attempts: 0,
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(runDir, 'queue', 'first_pass_done', 'redo-1'), 'redo-1\n');
+  const { child, workdir, run } = spawnSupervisor(scratch, `#!/bin/sh
+id=$(basename "$PWD")
+mkdir -p .fgs
+if [ "$id" != "mid-1" ]; then
+  exec sleep 120
+fi
+if [ ! -f .fgs/pass_marker ]; then
+  echo first > .fgs/pass_marker
+  printf '%s\\n' 76 > .fgs/dsh_step_count
+else
+  mkdir -p .fgs/projects/mid-1
+  printf '%s\\n' '{"state":"solved","updatedAt":"2000-01-01T00:00:00Z"}' > .fgs/projects/mid-1/meta.json
+fi
+exec sleep 120
+`, [
+    {
+      unique_code: 'mid-1',
+      description: 'promote then solve',
+      is_completed: false,
+      container_addr: ['http://10.8.0.51'],
+    },
+    {
+      unique_code: 'redo-1',
+      description: 'fail queue after the solve',
+      is_completed: false,
+      container_addr: ['http://10.8.0.52'],
+    },
+  ], {
+    CONTEST_MAX_ACTIVE: '1',
+    CONTEST_FGS_RETRY_LAST: '1',
+  });
+  let stderr = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for the fail-queue visit\n${stderr}`));
+      }, 15000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (/promote mid-1 n=76/.test(stderr) && /retire mid-1 \(solved\)/.test(stderr) && /visit redo-1 /.test(stderr) && /pass=fgs/.test(stderr)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', () => {
+        if (!/visit redo-1 /.test(stderr)) {
+          clearTimeout(timer);
+          reject(new Error(`driver exited before the fail-queue visit\n${stderr}`));
+        }
+      });
+    });
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'mid-1.json')), false);
+    assert.doesNotMatch(stderr, /fgs_slot_busy/);
+    const redo = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'redo-1.json'), 'utf8'));
+    assert.equal(redo.reason, 'reap');
+    assert.equal(redo.failed_at, '2026-01-01T00:00:00Z');
+    assert.equal(redo.fgs_attempts, 1);
+    const passes = fs.readFileSync(path.join(workdir, 'redo-1', '.contest', 'passes.jsonl'), 'utf8');
+    assert.match(passes, /"pass": "fgs"/);
+  } finally {
+    killLaunches(child, workdir, ['mid-1', 'redo-1']);
+  }
+});
+
+test('RETRY_LAST=1 still enqueues fgs_slot_busy while a new challenge is waiting', async () => {
+  const scratch = tmpDir('fgs-retry-last-busy-');
+  const { child, workdir, run } = spawnSupervisor(scratch, `#!/bin/sh
+id=$(basename "$PWD")
+mkdir -p .fgs
+if [ "$id" = "mid-1" ]; then
+  if [ ! -f .fgs/pass_marker ]; then
+    echo first > .fgs/pass_marker
+    printf '%s\\n' 90 > .fgs/dsh_step_count
+  fi
+  exec sleep 120
+fi
+if [ "$id" = "busy-1" ]; then
+  sleep 1
+  echo yes > .fgs/baseline_marker
+  printf '%s\\n' 76 > .fgs/dsh_step_count
+  exec sleep 120
+fi
+exec sleep 120
+`, [
+    {
+      unique_code: 'mid-1',
+      description: 'wins the only FGS slot',
+      is_completed: false,
+      container_addr: ['http://10.8.0.61'],
+    },
+    {
+      unique_code: 'busy-1',
+      description: 'past AFTER while the slot is taken',
+      is_completed: false,
+      container_addr: ['http://10.8.0.62'],
+    },
+    {
+      unique_code: 'fresh-1',
+      description: 'still a new challenge',
+      is_completed: false,
+      container_addr: ['http://10.8.0.63'],
+    },
+  ], {
+    CONTEST_MAX_ACTIVE: '2',
+    CONTEST_FGS_RETRY_LAST: '1',
+  });
+  let stderr = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for slot-busy beside a new challenge\n${stderr}`));
+      }, 15000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (
+          /promote mid-1 n=90/.test(stderr)
+          && /fail_queue fgs_slot_busy code=busy-1 n=76/.test(stderr)
+          && /visit fresh-1 /.test(stderr)
+        ) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', () => {
+        clearTimeout(timer);
+        reject(new Error(`driver exited before slot-busy beside a new challenge\n${stderr}`));
+      });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 1000));
+    const fail = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'busy-1.json'), 'utf8'));
+    assert.equal(fail.reason, 'fgs_slot_busy');
+    assert.equal(fail.fgs_attempts, 0);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'artifacts', 'busy-1', '.fgs', 'baseline_marker')), true);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'promote_enrich', 'busy-1')), false);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'mid-1.json')), false);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'fresh-1.json')), false);
+    assert.match(stderr, /contest: close busy-1/);
+    assert.doesNotMatch(stderr, /promote busy-1/);
+    assert.doesNotMatch(stderr, /visit busy-1 .* pass=fgs/);
+    const launch = JSON.parse(fs.readFileSync(path.join(workdir, 'busy-1', '.fgs', 'dsh-launch.json'), 'utf8'));
+    assert.equal(launch.pass, 'first');
+    assert.equal(pidGone(launch.pid), true);
+    const fresh = fs.readFileSync(path.join(workdir, 'fresh-1', '.contest', 'passes.jsonl'), 'utf8');
+    assert.match(fresh, /"pass": "first"/);
+    assert.doesNotMatch(fresh, /"pass": "fgs"/);
+  } finally {
+    killLaunches(child, workdir, ['mid-1', 'busy-1', 'fresh-1']);
+  }
+});
+
+test('upload docs cite absolute 75/125 and do not keep a full slot or clear the step file', () => {
+  const files = ['contest/UPLOAD_ENV.md', 'contest/SUPERVISOR.md', 'README.md'].map((rel) => ({
+    rel,
+    text: fs.readFileSync(path.join(repoRoot, rel), 'utf8'),
+  }));
+  const joined = files.map((item) => item.text).join('\n');
+  assert.match(joined, /CONTEST_CHALLENGE_FGS_AFTER_STEPS=75/);
+  assert.match(joined, /CONTEST_CHALLENGE_MAX_STEPS=125/);
+  for (const item of files) {
+    assert.match(item.text, /75/, item.rel);
+    assert.match(item.text, /125/, item.rel);
+    assert.match(item.text, /fgs_slot_busy/, item.rel);
+  }
+  assert.doesNotMatch(joined, /FGS_AFTER_STEPS=50/);
+  assert.doesNotMatch(joined, /MAX_STEPS=100/);
+  assert.doesNotMatch(joined, /槽满则不杀|槽满不杀/);
+  assert.doesNotMatch(joined, /清掉同一目录|删掉同一目录/);
+  assert.doesNotMatch(joined, /slot-full runs to 100|promote deletes dsh_step_count|keep pid to 100/i);
 });
