@@ -11,7 +11,7 @@
 
 **稳定性：** tip 含 PR#11 —— Challenges `close`/`list`/`start` 超时或断连只记日志、不崩 driver 主循环。
 
-**协议：** stock DeepSeek Messages。`agent-default-model` 指向 `deepseek-official` / `deepseek-flash`。`llm-deepseek.baseURL` 为 `https://api.deepseek.com/anthropic`（客户端再拼 `/v1/messages`）。会话记录里的协议名是 `anthropic_messages`。正式镜像（dsh 0.2.1-rc.2）上 Messages 的 `thinking` 是 `enabled`；设成 `disabled` 会 TRANSPORT 失败。本仓库 `profiles/contest/cordis.patch.yml` 与 `profiles/contest-baseline/cordis.patch.yml` 仍写 `disabled`。
+**协议：** stock DeepSeek Messages。`agent-default-model` 指向 `deepseek-official` / `deepseek-flash`。`llm-deepseek.baseURL` 为 `https://api.deepseek.com/anthropic`（客户端再拼 `/v1/messages`）。会话记录里的协议名是 `anthropic_messages`。正式镜像（dsh 0.2.1-rc.2）和本仓库 `profiles/contest/cordis.patch.yml`、`profiles/contest-baseline/cordis.patch.yml` 上 Messages 的 `thinking` 都是 `enabled`；设成 `disabled` 会 TRANSPORT 失败。
 
 **不要**在 `llm-pi-ai` 里再次声明 `deepseek-official`，更不要把它 patch 成 `openai-completions`。该 id 已是内置 Messages，再声明会被丢掉（`already declared`），请求仍走 Messages；配上 chat `/v1` 根路径就是 HTTP 404，worker 秒死、SCORE 不动。若必须走 completions，另用唯一 id `deepseek-contest`，本镜像默认不走这条。
 
@@ -29,7 +29,7 @@
 
 镜像内置 `@deepseek-ai/dsh@0.2.1-rc.2` 与 [dsh-ops v0.3.1](https://github.com/T-Auto/dsh-ops/releases/tag/v0.3.1)。四个组件全开：`dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc`。烟囱点名的工具是 `ops_bash`、`ops_glob`、`ops_inspect_local_file`。`contest-baseline` 与 `contest` 都有这些 ops 工具；只有 `contest` 挂 FGS。Messages 为 **`thinking: enabled`**。`thinking: disabled` 在 dsh 0.2.1-rc.2 上会 TRANSPORT 失败。细则见 README「[正式竞赛镜像](../README.md#contest-image-release)」。
 
-仓库里的 `profiles/contest/cordis.patch.yml` 与 `profiles/contest-baseline/cordis.patch.yml` 仍是 `thinking: disabled`，也没有 dsh-ops。示例 `contest/Dockerfile` 不安装 dsh / dsh-ops，拷贝的是这两份 profile，构建结果不是这份 Release。上传页要填的变量见下一节，没有新增项。
+仓库里的 `profiles/contest/cordis.patch.yml` 与 `profiles/contest-baseline/cordis.patch.yml` 同样是 `thinking: enabled`，四个组件 `dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc` 都是 `disabled: false`。两份 `package.json` 的 `bundles` 含 `dsh-ops`，依赖为 `file:/opt/dsh-ops`（只在正式镜像里解析）。示例 `contest/Dockerfile` 不安装 dsh / dsh-ops，拷贝的是这两份 profile，构建结果不是这份 Release。上传页要填的变量见下一节，没有新增项。
 
 ## 上传页必须填
 
@@ -160,7 +160,7 @@ A1–A3 锁的是 `CONTEST_FGS_MODE=after_sec` 的墙钟。`on_fail` 忽略墙�
 
 ## Baseline 轻约束
 
-这是 **harness / Cordis 钩子**，不是新的模型 tool，也不装 `dsh-routing-suite` / graded / super-injector。`prompt.txt` 里的「输出纪律」（PR#14）仍是软契约；本层用 `agent/pre-step` 在 `next()` 之后 `enter` 一批 sourced user message（`source.kind=plugin:contest-benchmark-tools`，format v4 producer-owned），保证写进**本步 admitted request**。轻约束不改 Messages 的 thinking 开关，也不改 Fail-then-FGS 队列。正式镜像上该开关是 `enabled`（见「[镜像内置](#contest-image-builtin)」）；本仓库 profile 文件仍写 `disabled`，单测照旧，本文件不要求改它们。
+这是 **harness / Cordis 钩子**，不是新的模型 tool，也不装 `dsh-routing-suite` / graded / super-injector。`prompt.txt` 里的「输出纪律」（PR#14）仍是软契约；本层用 `agent/pre-step` 在 `next()` 之后 `enter` 一批 sourced user message（`source.kind=plugin:contest-benchmark-tools`，format v4 producer-owned），保证写进**本步 admitted request**。轻约束不改 Messages 的 thinking 开关，也不改 Fail-then-FGS 队列。该开关在正式镜像和本仓库 profile 里都是 `thinking: enabled`（见「[镜像内置](#contest-image-builtin)」）。
 
 挂在已有的 `@local/contest-benchmark-tools`（baseline 与 contest 都会加载）。`inject` 仍只有 `['tools']`：`ctx.on('agent/pre-step')` 不需要 `agents` 服务，避免和 FGS profile 抢依赖。关总开关即可做 A/B。
 
