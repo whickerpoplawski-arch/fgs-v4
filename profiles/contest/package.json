@@ -6,7 +6,6 @@
       "bundles": [
         "@deepseek-ai/dsh-base",
         "@deepseek-ai/dsh-headless",
-        "dsh-ops",
         "@local/contest-benchmark-tools",
         "@local/fgs-deepseek-dsh"
       ]
@@ -14,7 +13,6 @@
   },
   "dependencies": {
     "@local/contest-benchmark-tools": "file:/opt/fgs-v4/contest-benchmark-tools",
-    "@local/fgs-deepseek-dsh": "file:/opt/fgs-v4",
-    "dsh-ops": "file:/opt/dsh-ops"
+    "@local/fgs-deepseek-dsh": "file:/opt/fgs-v4"
   }
 }

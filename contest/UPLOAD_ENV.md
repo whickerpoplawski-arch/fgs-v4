@@ -27,9 +27,9 @@
 
 当前正式包是 Release [`contest-image-6b5d71f`](https://github.com/whickerpoplawski-arch/fgs-v4/releases/tag/contest-image-6b5d71f)（提交 `6b5d71f2bcb684b452998316adc27fb7b56ba29e`）。下载 [`agent.tar.gz`](https://github.com/whickerpoplawski-arch/fgs-v4/releases/download/contest-image-6b5d71f/agent.tar.gz)。SHA256 `e1713e1485e1fccf3361b452823efaa79779ce3fc0fbe0dbcf32f3b260634ccf`。
 
-镜像内置 `@deepseek-ai/dsh@0.2.1-rc.2` 与 [dsh-ops v0.3.1](https://github.com/T-Auto/dsh-ops/releases/tag/v0.3.1)。四个组件全开：`dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc`。烟囱点名的工具是 `ops_bash`、`ops_glob`、`ops_inspect_local_file`。`contest-baseline` 与 `contest` 都有这些 ops 工具；只有 `contest` 挂 FGS。Messages 为 **`thinking: enabled`**。`thinking: disabled` 在 dsh 0.2.1-rc.2 上会 TRANSPORT 失败。细则见 README「[正式竞赛镜像](../README.md#contest-image-release)」。
+镜像内置 `@deepseek-ai/dsh@0.2.1-rc.2`。`contest-baseline` 与 `contest` 都不挂 dsh-ops；打靶用 dsh 自带的 bash / 文件工具。只有 `contest` 挂 FGS。Messages 为 **`thinking: enabled`**。`thinking: disabled` 在 dsh 0.2.1-rc.2 上会 TRANSPORT 失败。细则见 README「[正式竞赛镜像](../README.md#contest-image-release)」。
 
-仓库里的 `profiles/contest/cordis.patch.yml` 与 `profiles/contest-baseline/cordis.patch.yml` 同样是 `thinking: enabled`，四个组件 `dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc` 都是 `disabled: false`。两份 `package.json` 的 `bundles` 含 `dsh-ops`，依赖为 `file:/opt/dsh-ops`（只在正式镜像里解析）。示例 `contest/Dockerfile` 不安装 dsh / dsh-ops，拷贝的是这两份 profile，构建结果不是这份 Release。上传页要填的变量见下一节，没有新增项。
+仓库里的 `profiles/contest/cordis.patch.yml` 与 `profiles/contest-baseline/cordis.patch.yml` 同样是 `thinking: enabled`，并且不声明 dsh-ops 组件。两份 `package.json` 的 `bundles` 不含 `dsh-ops`，也没有 `file:/opt/dsh-ops`。示例 `contest/Dockerfile` 不安装 dsh，也不安装 `/opt/dsh-ops`，拷贝的是这两份 profile，构建结果不是这份 Release。已发布的 `contest-image-6b5d71f` tarball 仍是去掉 dsh-ops 之前的烘包。上传页要填的变量见下一节，没有新增项。
 
 ## 上传页必须填
 
