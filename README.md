@@ -292,13 +292,14 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_DSH_LAUNCH=1` | 可选 | 本骨架**不**内置 dsh。未设置时只写 `.fgs/dsh-launch.json` 占位。profile 用 stock Messages（`deepseek-official`），不要把该 id patch 成 openai-completions |
 | `CONTEST_DSH_PROFILE` | `contest-baseline` | 新题一遍的 `--profile`。bundles 不含 FGS |
 | `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 `--profile`。含 FGS + `benchmark_*` |
-| `CONTEST_FGS_MODE` | `on_fail` | 新题保持 baseline。失败（进程已死、deferred 过宽限、或可选预算超时）才 FIFO 二遍。`after_sec` 是旧墙钟且不重试。`off` 永不 FGS |
+| `CONTEST_FGS_MODE` | `on_fail` | 新题保持 baseline。失败（进程已死、deferred 过宽限、一遍步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或可选墙钟预算）才 FIFO 二遍。`after_sec` 是旧墙钟且不重试。`off` 永不 FGS |
+| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 一遍 pre-step 上限。`0` 关。`> N` 才入失败队。上传推荐 `100`。FGS 二遍不吃这个上限，也不吃 `CONTEST_FAIL_ON_BUDGET` |
 | `CONTEST_FGS_AFTER_SEC` | `7200` | **仅 `mode=after_sec`。** `on_fail` 忽略。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
 | `CONTEST_FGS_RETRY_LAST` | `1` | 有新题时不跑 FGS |
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
 | `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数 |
 | `CONTEST_SKIP_FGS_SEED` | `auto` | 仅 FGS profile 预种。baseline 跳过 bootstrap。二遍在预种后按 baseline 产物补图 |
-| `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书的时间预算（分钟） |
+| `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书的时间预算（分钟）。只在 `CONTEST_FAIL_ON_BUDGET=1` 时退休**一遍** worker |
 | `BENCHMARK_API_PREFIX` | 可选 | 不设时 list/start 先试 `/api/v1`，再试 `/openapi/v1`（与 `tools/submit_flag.mjs` 的提交路径同族） |
 | `RUN` | 可选 | 监管根目录（`workers/`、`monitor/`、`attempted/`）。不设时 entrypoint 用 `CONTEST_WORKDIR` |
 | `CONTEST_SUPERVISOR` | 默认开 | `1`：driver 内循环做 reap / retire / 双护栏补派。`0` 关闭，回到一次性 visit（本地单测） |

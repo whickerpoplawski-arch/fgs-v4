@@ -1,8 +1,9 @@
 """Fail-then-FGS queue.
 
 New challenges stay on the baseline profile. A challenge enters this queue
-only under the narrow fail rule (dead worker, deferred past grace, or an
-optional budget retire). Disk state lives under ``$RUN/queue`` so a later
+only under the narrow fail rule (dead worker, deferred past grace, an
+optional first-pass step cap, or an optional budget retire). Disk state
+lives under ``$RUN/queue`` so a later
 tick can dispatch one FGS pass without touching other workers.
 """
 
@@ -89,6 +90,36 @@ def fgs_max_retries() -> int:
 def fail_on_budget() -> bool:
     """Optional. Default off so a slow baseline worker is not retired."""
     return env_bool("CONTEST_FAIL_ON_BUDGET", False)
+
+
+def challenge_max_steps() -> int:
+    """First-pass pre-step cap. ``0`` disables. Upload recommendation is 100.
+
+    Compared with ``> N`` (a worker at exactly ``N`` keeps running). FGS
+    passes ignore this cap. Orthogonal to ``CONTEST_FAIL_ON_BUDGET``.
+    """
+    return env_int_default("CONTEST_CHALLENGE_MAX_STEPS", 0, minimum=0)
+
+
+def read_step_count(directory: str | Path | None) -> int | None:
+    """Read ``.fgs/dsh_step_count``. Missing or unreadable is fail-open."""
+    if not directory:
+        return None
+    path = Path(directory) / ".fgs" / "dsh_step_count"
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not raw:
+        return None
+    token = raw.split()[0]
+    try:
+        value = int(token)
+    except ValueError:
+        return None
+    if value < 0:
+        return None
+    return value
 
 
 def stamp_utc(now: datetime | None = None) -> str:
@@ -283,12 +314,14 @@ def failure_reason(
     budget_past: bool,
     fail_on_budget: bool,
     transport_glitch: bool,
+    steps_past: bool = False,
 ) -> str | None:
     """Narrow fail rule. ``None`` means do not enqueue FGS.
 
     A platform list/close glitch is not a fail. A live worker is not a fail,
-    including when flags are still missing. ``is_completed`` / meta ``solved``
-    is a solved archive, never a fail.
+    including when flags are still missing, unless ``steps_past`` or the
+    optional budget cap says so. ``is_completed`` / meta ``solved`` is a
+    solved archive, never a fail.
     """
     if transport_glitch:
         return None
@@ -297,6 +330,8 @@ def failure_reason(
         return None
     if state == "deferred" and deferred_past_grace:
         return "deferred"
+    if steps_past:
+        return "steps"
     if fail_on_budget and budget_past:
         return "budget"
     if alive:
@@ -450,29 +485,83 @@ def select_dispatch(
     return chosen
 
 
-def plan_budget_retire(workers, challenges, *, now: datetime, enabled: bool) -> list[dict]:
-    """Force-retire a live worker that outlived its budget. Default caller is off.
-
-    Deferred and solved workers stay on ``plan_retire``. A challenge the
-    platform already completed is not a budget fail.
-    """
-    if not enabled:
-        return []
+def _completed_codes(challenges) -> set[str]:
     completed = set()
     for item in challenges or []:
         if isinstance(item, dict) and is_completed(item):
             code = challenge_code(item)
             if code:
                 completed.add(code)
+    return completed
+
+
+def _first_pass_live(worker, completed: set[str]) -> str:
+    """Return the code when this live worker may take a first-pass cap.
+
+    FGS passes, deferred, solved, and platform-completed codes return ``""``.
+    """
+    if not worker.get("alive"):
+        return ""
+    code = str(worker.get("code") or "").strip()
+    if not code or code in completed:
+        return ""
+    state = str(worker.get("meta_state") or "").strip().lower()
+    if state in ("deferred", "solved"):
+        return ""
+    if str(worker.get("pass_kind") or "first").strip().lower() == "fgs":
+        return ""
+    return code
+
+
+def plan_steps_retire(workers, challenges, *, limit: int) -> list[dict]:
+    """Retire a live first pass whose step sidecar is past ``limit``.
+
+    ``limit <= 0`` disables the check. Comparison is strict ``> limit``.
+    A missing step count is fail-open. FGS passes are never step-retired.
+    """
+    if limit <= 0:
+        return []
+    completed = _completed_codes(challenges)
     actions = []
     for worker in workers or []:
-        if not worker.get("alive"):
+        code = _first_pass_live(worker, completed)
+        if not code:
             continue
-        code = str(worker.get("code") or "").strip()
-        if not code or code in completed:
+        try:
+            steps = int(worker.get("step_count"))
+        except (TypeError, ValueError):
             continue
-        state = str(worker.get("meta_state") or "").strip().lower()
-        if state in ("deferred", "solved"):
+        if steps <= limit:
+            continue
+        actions.append({
+            "op": "retire",
+            "code": code,
+            "state": "steps",
+            "pid": worker.get("pid"),
+            "dir": worker.get("dir"),
+            "archive": False,
+            "remaining": 0,
+            "grace": 0,
+            "reason": "steps",
+            "step_count": steps,
+        })
+    return actions
+
+
+def plan_budget_retire(workers, challenges, *, now: datetime, enabled: bool) -> list[dict]:
+    """Force-retire a live first pass that outlived its budget. Default caller is off.
+
+    Deferred and solved workers stay on ``plan_retire``. A challenge the
+    platform already completed is not a budget fail. An FGS pass is not a
+    budget fail either: the last-round retry has no wall-clock cap.
+    """
+    if not enabled:
+        return []
+    completed = _completed_codes(challenges)
+    actions = []
+    for worker in workers or []:
+        code = _first_pass_live(worker, completed)
+        if not code:
             continue
         try:
             minutes = float(worker.get("budget_min"))

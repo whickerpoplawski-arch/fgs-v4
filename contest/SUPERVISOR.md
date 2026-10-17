@@ -13,7 +13,7 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 `CONTEST_SUPERVISOR` 默认开启。循环在 driver 进程内，顺序是：
 
 1. **reap** — 容器仍是 `available` / `pending` / `stop_pending`，或本进程启动过的 worker 已经退出，且没有存活 pid → `close` 一次。有存活 pid → 留下。
-2. **retire** — 存活 worker 的 meta 是 `deferred` 或 `solved`，或平台 `is_completed`。过宽限后 `SIGTERM`，仍在则 `SIGKILL`，然后 `close`。平台已通关但 meta 还不是 `solved` 用短宽限（默认 30 秒），其余默认 60 秒。`solved`（含平台对账）会把 worker 目录归档为 `_done_*`。
+2. **retire** — 存活 worker 的 meta 是 `deferred` 或 `solved`，或平台 `is_completed`。过宽限后 `SIGTERM`，仍在则 `SIGKILL`，然后 `close`。平台已通关但 meta 还不是 `solved` 用短宽限（默认 30 秒），其余默认 60 秒。`solved`（含平台对账）会把 worker 目录归档为 `_done_*`。`on_fail` 下还可选：一遍步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或 `CONTEST_FAIL_ON_BUDGET=1` 时墙钟超过预算。这两条只打 `pass_kind=first`。FGS 二遍不因步数或墙钟 retire。
 3. **gc** — `monitor_sampler.sh loop` 的 `SESSION_ID` 不属于存活 worker 时杀掉。
 4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才补人。默认 `CONTEST_FGS_MODE=on_fail` 时先派未做过一遍的新题（profile `contest-baseline`，不预种）。新题没有了，才按 `failed_at` 从早到晚派失败题的二遍（profile `contest`，预种并补图），同时活着的 FGS worker 不超过 `CONTEST_FGS_MAX_ACTIVE`。`CONTEST_FGS_RETRY_LAST=1` 时，只要还有新题，这一轮就不派 FGS。列表失败时按活跃容器已满处理，不补派，也不把题写进失败队列。
 
@@ -24,9 +24,11 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 同时满足才写入 `$RUN/queue/failed/<code>.json`：
 
 1. 平台 `is_completed` / `completed` 不是真，本地 meta 也不是 `solved`。
-2. 并且是下面之一：worker 进程已经死掉（reap）；或 meta `deferred` 且过了 `CONTEST_RETIRE_GRACE` 被 retire；或显式打开 `CONTEST_FAIL_ON_BUDGET=1` 后，活着的 worker 超过本题预算仍未通关被 retire。
+2. 并且是下面之一：worker 进程已经死掉（reap）；或 meta `deferred` 且过了 `CONTEST_RETIRE_GRACE` 被 retire；或 `CONTEST_CHALLENGE_MAX_STEPS>0` 且一遍 worker 的步数旁路 **大于** N（恰好等于 N 继续跑）；或显式打开 `CONTEST_FAIL_ON_BUDGET=1` 后，活着的一遍 worker 超过本题墙钟预算仍未通关被 retire。
 
-还在跑、多 flag 没齐、close/list 超时，都不是失败。通关走 solved 归档，禁止再 FGS。
+还在跑、多 flag 没齐、close/list 超时，都不是失败。通关走 solved 归档，禁止再 FGS。列表毛刺只 park，不因步数入队。`pass_kind=fgs` 不再入队：步数上限和墙钟预算都不作用于二遍；reap、deferred 宽限、`CONTEST_FGS_MAX_RETRIES` / `fgs_done` 仍在。二遍再失败不会写第二条 `failed/` 记录。
+
+步数旁路是工作目录 `.fgs/dsh_step_count`（单调整数）。`contest-benchmark-tools` 每次 `agent/pre-step` 加一。Supervisor 只读该文件；缺文件或不是非负整数则本轮不因步数 retire。这个 `n` 是 pre-step 次数，不是 DSH session 的 `pagination.total`（后者还计 system / user / assistant / tool_result）。成功样本的 session 步数大约在 40–50，通常对应更少的 pre-step；长空转仍会晚一些跨过同一数字。上传推荐 `100`。建图仍在末轮 FGS 二遍（seed + enrich），失败当下只快照产物，不派 FGS 占槽。
 
 一遍结束记在 `queue/first_pass_done/<code>`，不再表示「永远不派」。二遍派过并达到 `CONTEST_FGS_MAX_RETRIES` 后记 `queue/fgs_done/<code>`。baseline 产物快照在 `queue/artifacts/<code>/`。补图从这里抽 Fact（做过什么、已验证、已排除，不写裸 flag）和一条继续利用的 Intent。产物为空则只种 origin/goal，日志 `enrich=empty`。
 
@@ -56,7 +58,8 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_FGS_RETRY_LAST` | `1` | `1`：有新题就不跑 FGS。`0`：可以和新题同一轮并行，仍受下面的上限 |
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
 | `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数。用尽后写 `fgs_done` |
-| `CONTEST_FAIL_ON_BUDGET` | 关 | `1` 才把「活过预算仍未通关」当失败。默认关 |
+| `CONTEST_FAIL_ON_BUDGET` | 关 | `1` 才把「活过墙钟预算仍未通关」的**一遍**当失败。默认关。FGS 二遍忽略 |
+| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 一遍 pre-step 上限。`0` 关。`> N` 才 retire 并入失败队（满 N 仍跑）。上传推荐 `100`。FGS 二遍忽略。与墙钟预算正交 |
 | `CONTEST_SKIP_FGS_SEED` | `auto` | `auto`：只有 FGS profile 预种图。`1` 一律不预种。`0` 一律预种 |
 | `CONTEST_CHALLENGE_BUDGET_MIN` | `60` | Solver 任务书里的「本题时间预算」分钟数。平台字段优先 |
 
@@ -84,6 +87,7 @@ CONTEST_FGS_MAX_ACTIVE=1
 CONTEST_FGS_MAX_RETRIES=1
 SOLVER_GATEWAY=1
 DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
+# 上传页另写 CONTEST_CHALLENGE_MAX_STEPS=100（代码默认 0；不写则不按步数腾槽）
 # + BENCHMARK_TOKEN / BENCHMARK_BASE_URL / DEEPSEEK_API_KEY（运行时注入，勿进镜像）
 # 协议：stock Messages（deepseek-official）。不要把该 id patch 成 openai-completions。
 ```

@@ -23,6 +23,12 @@ import {
   shouldBreak,
   similarFingerprints,
 } from '../contest-benchmark-tools/light_constraint.js';
+import {
+  applyStepCount,
+  bumpStepCount,
+  readStepCount,
+  stepCountPath,
+} from '../contest-benchmark-tools/step_count.js';
 
 /** Mirrors dsh session-format-v3-to-v4 `source()`: reject empty / non-string / literal `plugin`. */
 function assertV4ProducerOwnedSource(source) {
@@ -339,4 +345,36 @@ test('baseline profile still has no FGS bundle after light-constraint landing', 
   const patch = fs.readFileSync(path.join(repoRoot, 'profiles', 'contest-baseline', 'cordis.patch.yml'), 'utf8');
   assert.match(patch, /thinking: disabled/);
   assert.doesNotMatch(patch, /dsh-routing-suite|fgs-deepseek-dsh|graded|super-injector/);
+});
+
+test('pre-step writes a monotonic .fgs/dsh_step_count and leaves a missing file alone', async () => {
+  const cwd = tmpDir('step-count-');
+  assert.equal(readStepCount(cwd), null);
+  assert.equal(bumpStepCount(cwd), 1);
+  const ctx = makeBus();
+  const dispose = applyStepCount(ctx);
+  await preStep(ctx, fakeAgent(cwd));
+  await preStep(ctx, fakeAgent(cwd));
+  assert.equal(readStepCount(cwd), 3);
+  assert.equal(fs.readFileSync(stepCountPath(cwd), 'utf8'), '3\n');
+  dispose();
+  assert.equal(readStepCount(tmpDir('step-missing-')), null);
+});
+
+test('step counting stays on when the light-constraint kill switch is off', async () => {
+  const cwd = tmpDir('step-light-off-');
+  const ctx = makeBus();
+  const prev = process.env.CONTEST_LIGHT_CONSTRAINT;
+  process.env.CONTEST_LIGHT_CONSTRAINT = '0';
+  try {
+    const { apply } = await import('../contest-benchmark-tools/index.js');
+    const dispose = apply(ctx);
+    await preStep(ctx, fakeAgent(cwd));
+    assert.equal(readStepCount(cwd), 1);
+    assert.ok(ctx.events.has('agent/pre-step'));
+    dispose();
+  } finally {
+    if (prev === undefined) delete process.env.CONTEST_LIGHT_CONSTRAINT;
+    else process.env.CONTEST_LIGHT_CONSTRAINT = prev;
+  }
 });
