@@ -1474,7 +1474,7 @@ exec sleep 120
   try {
     await new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        reject(new Error(`timed out waiting for both visits\n${stderr}`));
+        reject(new Error(`timed out waiting for slot-busy retire+close\n${stderr}`));
       }, 15000);
       child.stderr.on('data', (chunk) => {
         stderr += chunk;
@@ -1483,6 +1483,8 @@ exec sleep 120
           && /visit redo-1 /.test(stderr)
           && /pass=fgs/.test(stderr)
           && /fail_queue fgs_slot_busy code=slow-1 n=76/.test(stderr)
+          && /retire slow-1 \(fgs_slot_busy\)/.test(stderr)
+          && /contest: close slow-1/.test(stderr)
         ) {
           clearTimeout(timer);
           resolve();
