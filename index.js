@@ -27,7 +27,6 @@ import {
   dropSubGoalOp,
   dropStepOp,
   openStepOp,
-  releaseStepOp,
   reopenOp,
   satisfyGoalOp,
   seedOriginOp,
@@ -57,7 +56,7 @@ export const PLUGIN_GENERATION = 12;
 export const BUILD_TAG = '12+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
   + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt'
-  + '+benchmark-allow';
+  + '+benchmark-allow+ttl-conclude';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -571,6 +570,7 @@ function createRun(agent, cfg, registry, problemId) {
     stepsOpenedIds: null,
     registry,
     executeStartedAt: null,
+    executePhase: null,
   };
 }
 
@@ -1045,35 +1045,79 @@ function stopIfDeferredSession(exec, registry, problemId) {
   if (typeof exec?.concludeTurn === 'function') exec.concludeTurn();
 }
 
-function markDeferred(registry, run, unfinishedFactId) {
-  if (!registry || !run?.problemId) return;
-  const prev = registry.readMeta(run.problemId) ?? {};
-  if (prev.state === 'deferred') {
-    registry.setProblemState(run.problemId, 'deferred');
-    return;
-  }
-  const deferredAt = new Date().toISOString();
-  registry.writeMeta(run.problemId, {
-    id: run.problemId,
-    title: prev.title ?? run.problemId,
-    state: 'deferred',
-    model: prev.model ?? null,
-    budget: prev.budget ?? null,
-    roundSeq: prev.roundSeq ?? run.roundSeq ?? 0,
-    createdAt: prev.createdAt ?? deferredAt,
-    updatedAt: deferredAt,
-    deferredAt,
-    deferredReason: 'execute_timeout',
-    unfinishedFactId: unfinishedFactId ?? prev.unfinishedFactId ?? null,
-  });
-  registry.setProblemState(run.problemId, 'deferred');
+const CONCLUDE_ALLOW_TOOLS = new Set([
+  'fgs_submit_fact',
+  'fgs_commit_step',
+  'fgs_status',
+  'fgs_preview',
+  ...EGRESS_TOOLS,
+]);
+
+function concludeBlocksTool(tool, run) {
+  if (run?.executePhase !== 'conclude') return false;
+  return !CONCLUDE_ALLOW_TOOLS.has(tool);
 }
 
-function maybeRetarget(registry, deferredId) {
-  if (!registry || !deferredId) return;
-  const next = pickScheduleTarget(registry);
-  if (!next || next.deferred || next.id === deferredId) return;
-  if (registry.getActive() === deferredId) registry.setActive(next.id);
+function concludeStopMessage(tool) {
+  return `FGS Execute 已进入收束（conclude）：停止环境工具 ${tool}。`
+    + '立刻 fgs_submit_fact 写下已确认的增量 Fact，再 fgs_commit_step 关闭本 step，然后回到 Decide。'
+    + '不要再探索，不要等待。';
+}
+
+function concludeContextNote(run) {
+  if (run?.executePhase !== 'conclude') return '';
+  return [
+    '【收束 conclude】这条说明覆盖先前的探索指令。',
+    '探索时限已到。立刻停止环境工具，不要再下命令，不要等待未完成的结果。',
+    '只用已经确认的增量调用 fgs_submit_fact，然后 fgs_commit_step 关闭当前 step。',
+    '收束后回到 Decide。未确认的猜测不要写进 Fact。',
+  ].join('\n');
+}
+
+function concludeFactDraft(run, step) {
+  if (run.execDraft && (!run.execDraft.stepId || run.execDraft.stepId === step.id)) {
+    return run.execDraft;
+  }
+  const expired = takeExpiredDraft(run, step.id);
+  if (expired) return expiredDraftAsFact(expired, step.id);
+  return {
+    title: clipChars(`${step.id} 收束`, 120),
+    content: [
+      describeTried(run, step),
+      '探索时限到了，已确认的增量在此收束。',
+    ].join('\n'),
+    stepId: step.id,
+    findingType: null,
+  };
+}
+
+/** 同会话收束：一条普通 Fact + 关闭 step。不写未完成 Fact，不把题目标成 deferred。 */
+function concludeOwnedStep(run, step) {
+  const registry = run.registry ?? null;
+  const live = run.store.load();
+  const current = (live.steps ?? []).find((item) => item.id === step.id);
+  if (!current || current.state !== 'open' || (current.owner && current.owner !== run.sid)) {
+    run.executePhase = null;
+    finishExecuteSession(run, step.id);
+    return live;
+  }
+  const draft = concludeFactDraft(run, current);
+  const next = run.controller.apply(
+    submitFactOp({
+      title: draft.title,
+      content: draft.content,
+      producedBy: current.id,
+      findingType: draft.findingType ?? null,
+    }),
+    live,
+  );
+  run.controller.commit(next);
+  run.execDraft = null;
+  run.execDraftAt = null;
+  run.executePhase = null;
+  finishExecuteSession(run, current.id);
+  syncProjectMeta(registry, run, next);
+  return next;
 }
 
 function finishExecuteSession(run, stepId) {
@@ -1103,40 +1147,6 @@ function currentOwnedStep(run, owned) {
   return owned[0];
 }
 
-/** 幂等：未完成 Fact → 释放认领 → deferred → 清草稿并离开 Execute。 */
-function timeoutSettle(run, step) {
-  const registry = run.registry ?? null;
-  const live = run.store.load();
-  const current = (live.steps ?? []).find((item) => item.id === step.id);
-  if (!current || current.state !== 'open' || (current.owner && current.owner !== run.sid)) {
-    finishExecuteSession(run, step.id);
-    return live;
-  }
-  if (!current.owner && current.linkedUnfinishedFactId) {
-    markDeferred(registry, run, current.linkedUnfinishedFactId);
-    finishExecuteSession(run, current.id);
-    maybeRetarget(registry, run.problemId);
-    return live;
-  }
-  const action = clipChars(String(current.action ?? '').replace(/\s+/g, ' '), 80);
-  const title = clipChars(`未完成：${current.id} Execute 会话超时`, 120);
-  const content = [
-    `卡在：${current.id}${action ? `（${action}）` : ''}，step 仍为 open。`,
-    describeTried(run, current),
-    '为何停：execute_session_ttl 超时。',
-  ].join('\n');
-  const next = run.controller.apply(
-    releaseStepOp({ stepId: current.id, factTitle: title, factContent: content }),
-    live,
-  );
-  run.controller.commit(next);
-  const updated = next.steps.find((item) => item.id === current.id);
-  markDeferred(registry, run, updated?.linkedUnfinishedFactId ?? null);
-  finishExecuteSession(run, current.id);
-  maybeRetarget(registry, run.problemId);
-  return next;
-}
-
 function refreshRole(run) {
   const now = sessionNow(run);
   const cfg = run.cfg ?? DEFAULT_CONFIG;
@@ -1144,8 +1154,11 @@ function refreshRole(run) {
   if (executeExpired(run, now)) {
     const graph0 = run.store.load();
     const mine0 = openStepsOf(graph0).filter((s) => stepOwnerOf(s) === run.sid);
-    if (mine0.length > 0) timeoutSettle(run, currentOwnedStep(run, mine0));
-    else run.executeStartedAt = null;
+    if (mine0.length > 0) run.executePhase = 'conclude';
+    else {
+      run.executeStartedAt = null;
+      run.executePhase = null;
+    }
   }
   expireStaleDraft(run, cfg);
   const graph = run.store.load();
@@ -1164,6 +1177,7 @@ function refreshRole(run) {
   // 「操作 FGS 图」的职责就永远没人能做，图会僵死）。
   // 认领（claim）**不再隐式发生**：接手别人的 Step 走显式的 fgs_claim_step，
   // 这样 Step↔Run 的绑定永远是一次可审计的显式派发（v1 Dispatcher 语义在这儿落地）。
+  run.executePhase = null;
   run.role = 'decide';
   run.currentStepId = null;
   run.executeStartedAt = null;
@@ -2206,15 +2220,17 @@ function resolveRoundStep(run, graph, stepId) {
  * 失败只记账不抛：收束失败绝不能阻断回合结束。
  */
 function forceCloseStep(run, turn, registry) {
-  if (executeExpired(run, sessionNow(run))) {
+  if (run.executePhase === 'conclude' || executeExpired(run, sessionNow(run))) {
     const graphNow = run.store.load();
     const mine = openStepsOf(graphNow).filter((s) => stepOwnerOf(s) === run.sid);
     if (mine.length > 0) {
       if (!run.registry && registry) run.registry = registry;
-      timeoutSettle(run, currentOwnedStep(run, mine));
+      concludeOwnedStep(run, currentOwnedStep(run, mine));
+      refreshRole(run);
       return true;
     }
     run.executeStartedAt = null;
+    run.executePhase = null;
     run.role = 'decide';
   }
   const { round, limited } = observeRound(run, turn);
@@ -2356,6 +2372,9 @@ export function apply(ctx, config = {}) {
       const meta = deferredMetaOf(registry, problemId);
       stopIfDeferredSession(exec, registry, problemId);
       return deferredStopMessage(meta, tool);
+    }
+    if (run && concludeBlocksTool(tool, run)) {
+      return concludeStopMessage(tool);
     }
     if (GRAPH_TOOL_NAMES.includes(tool)) {
       if (!problemId) {
@@ -2514,6 +2533,7 @@ export function apply(ctx, config = {}) {
             sid: run.sid,
             stepLeaseMs: run.cfg?.stepLeaseMs ?? 0,
             scheduleNote: contextScheduleNote(registry, run, graph),
+            concludeNote: concludeContextNote(run),
           });
         } catch (error) {
           return `【FGS 图读取失败】${error?.message ?? error}`;

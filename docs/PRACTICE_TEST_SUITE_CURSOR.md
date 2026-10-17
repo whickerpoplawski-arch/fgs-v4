@@ -267,28 +267,28 @@ rm -f "$CASE/.fgs/projects/<problemId>/graph.json"
 
    > 时间到了。不要调用环境工具，不要新开 step，不要 fgs_commit_step。
 
-6. 立刻读 `graph.yaml` 和 `meta.json`。记下未完成 Fact 的 id。
-7. 再等一个 TTL（或把第 5 步再发一次），然后重读这两个文件。
+6. 立刻读 `graph.yaml` 和 `meta.json`。
+7. 若 step 仍是 open：再发一条让回合结束（或等宿主 `turn-stopping`），然后重读这两个文件。
+8. 再等一个 TTL，重读这两个文件。
 
 **期望（黑板）**
 
-第一次 settle 之后：
+收束完成之后：
 
-- 相对第 2 步，新增 **一条** Fact。正文或标题能看出未完成，并同时带有「卡在」「已试」「为何停」三类信息
-- 这不是信号兜底那句「未经模型收束」的空记录
-- 该 step 仍是 `state: open`，`owner` 为空（字段消失或空）
-- `meta.json` 有 deferred 标记（键名含 `deferred`，且不是空）。若同时有 `linkedUnfinishedFactId`（在 step 上或 meta 里），它指向这条 Fact
+- 相对第 2 步，新增 **一条** Fact，step 为 `done`，`to` 指向这条 Fact
+- 这不是 `kind: unfinished`，也不是「未完成 Fact」
+- `meta.json` **没有** `deferred` 标记
+- 角色回到 Decide。可以再开一条新 step。环境工具在新 step 打开前按 Decide 门禁拒绝
 - `goal_final` 没有 `satisfiedBy`
 
-第二次 settle 之后：
+第二次等待之后：
 
-- 这条未完成 Fact 的 id 还在，没有第二条内容相同或同一 step 的未完成 Fact
-- facts 条数不因再 settle 而增加
-- step 不会因此被收成 `done`，`goal_final` 仍未满足
+- facts 条数不增加
+- 不会另写一条未完成 Fact，也不会把题目标成 deferred
 
-**通过：** 富未完成 Fact + 释放认领 + deferred，且再 settle 不双写。
+**通过：** 一条收束 Fact + step 关闭 + 回到 Decide，且再等不双写。
 
-**失败：** TTL 过后图仍只有 `fact_origin`；或唯一新 Fact 是「未经模型收束」；或 step 仍挂着本会话 `owner`；或 meta 没有 deferred；或第二次 settle 又追加一条未完成 Fact。模型在 TTL 之前自己 `fgs_commit_step` 了，本例作废重跑。
+**失败：** TTL 过后图仍只有 `fact_origin` 且 step 一直 open；或 meta 被标成 deferred；或 step 仍 open 同时环境工具被永久拒绝；或第二次 settle 又追加一条 Fact。模型在 TTL 之前自己 `fgs_commit_step` 了，本例作废重跑。
 
 ---
 
