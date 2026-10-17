@@ -541,3 +541,340 @@ exit 0
     }
   }
 });
+
+test('step cap is first-pass only, keeps failed_at, and parks on a list glitch', () => {
+  const scratch = tmpDir('fgs-steps-unit-');
+  const work = path.join(scratch, 'over');
+  fs.mkdirSync(path.join(work, '.fgs'), { recursive: true });
+  fs.writeFileSync(path.join(work, '.fgs', 'dsh_step_count'), '101\n');
+  const script = `
+import json, os
+from datetime import datetime, timezone
+from pathlib import Path
+import driver
+from fail_queue import (
+    challenge_max_steps, failure_reason, plan_steps_retire, plan_budget_retire,
+    read_step_count, register_fail,
+)
+
+os.environ.pop("CONTEST_CHALLENGE_MAX_STEPS", None)
+default_limit = challenge_max_steps()
+os.environ["CONTEST_CHALLENGE_MAX_STEPS"] = "100"
+limit = challenge_max_steps()
+run = Path(${JSON.stringify(scratch)})
+work = Path(${JSON.stringify(work)})
+
+def worker(code, **extra):
+    base = {
+        "code": code, "alive": True, "pid": 7, "dir": str(work),
+        "meta_state": "running", "pass_kind": "first", "step_count": 101,
+        "started_at": "2026-01-01T00:00:00Z", "budget_min": "1",
+    }
+    base.update(extra)
+    return base
+
+challenges = [
+    {"unique_code": "over-1", "is_completed": False},
+    {"unique_code": "exact-1", "is_completed": False},
+    {"unique_code": "done-1", "is_completed": True},
+    {"unique_code": "fgs-1", "is_completed": False},
+    {"unique_code": "miss-1", "is_completed": False},
+    {"unique_code": "def-1", "is_completed": False},
+]
+workers = [
+    worker("over-1", step_count=101),
+    worker("exact-1", step_count=100),
+    worker("done-1", step_count=400),
+    worker("fgs-1", pass_kind="fgs", step_count=900),
+    worker("miss-1", step_count=None),
+    worker("dead-1", alive=False, step_count=500),
+    worker("def-1", meta_state="deferred", step_count=500),
+]
+steps = [item["code"] for item in plan_steps_retire(workers, challenges, limit=limit)]
+off = plan_steps_retire(workers, challenges, limit=0)
+budget = [
+    item["code"] for item in plan_budget_retire(
+        workers, challenges, now=datetime(2026, 1, 1, 3, tzinfo=timezone.utc), enabled=True,
+    )
+]
+common = dict(
+    completed=False, alive=True, launched=True, meta_state="running",
+    deferred_past_grace=False, budget_past=False, fail_on_budget=False, transport_glitch=False,
+)
+reasons = {
+    "steps": failure_reason(**common, steps_past=True),
+    "steps_done": failure_reason(**{**common, "completed": True}, steps_past=True),
+    "steps_solved": failure_reason(**{**common, "meta_state": "solved"}, steps_past=True),
+    "glitch": failure_reason(**{**common, "transport_glitch": True}, steps_past=True),
+    "under": failure_reason(**common, steps_past=False),
+}
+driver._note_retire_fail(
+    run,
+    {"code": "over-1", "state": "steps", "dir": str(work), "step_count": 101},
+    {"pass_kind": "first"},
+    [{"unique_code": "over-1", "is_completed": False}],
+    list_failed=False,
+)
+first = register_fail(run, unique_code="over-1", reason="reap", artifact_dir="/tmp/other", now=datetime(2026, 6, 1, tzinfo=timezone.utc))
+driver._note_retire_fail(
+    run,
+    {"code": "done-1", "state": "steps", "dir": str(work), "step_count": 400},
+    {"pass_kind": "first"},
+    [{"unique_code": "done-1", "is_completed": True}],
+    list_failed=False,
+)
+driver._note_retire_fail(
+    run,
+    {"code": "fgs-1", "state": "steps", "dir": str(work), "step_count": 900},
+    {"pass_kind": "fgs"},
+    [{"unique_code": "fgs-1", "is_completed": False}],
+    list_failed=False,
+)
+driver._note_retire_fail(
+    run,
+    {"code": "park-1", "state": "steps", "dir": str(work), "step_count": 150},
+    {"pass_kind": "first"},
+    [{"unique_code": "park-1", "is_completed": False}],
+    list_failed=True,
+)
+print(json.dumps({
+    "default_limit": default_limit,
+    "limit": limit,
+    "read": read_step_count(work),
+    "missing": read_step_count(run / "nope"),
+    "steps": steps,
+    "off": len(off),
+    "budget": budget,
+    "reasons": reasons,
+    "kept_at": first["failed_at"],
+    "kept_reason": first["reason"],
+    "done_file": (run / "queue" / "failed" / "done-1.json").exists(),
+    "fgs_file": (run / "queue" / "failed" / "fgs-1.json").exists(),
+    "park_file": (run / "queue" / "failed" / "park-1.json").exists(),
+    "parked": (run / "queue" / "pending_classify" / "park-1.json").exists(),
+}))
+`;
+  const { body, stderr } = pyJson(script);
+  assert.equal(body.default_limit, 0);
+  assert.equal(body.limit, 100);
+  assert.equal(body.read, 101);
+  assert.equal(body.missing, null);
+  assert.deepEqual(body.steps, ['over-1']);
+  assert.equal(body.off, 0);
+  assert.deepEqual(body.budget, ['over-1', 'exact-1', 'miss-1']);
+  assert.equal(body.reasons.steps, 'steps');
+  assert.equal(body.reasons.steps_done, null);
+  assert.equal(body.reasons.steps_solved, null);
+  assert.equal(body.reasons.glitch, null);
+  assert.equal(body.reasons.under, null);
+  assert.equal(body.kept_at, JSON.parse(fs.readFileSync(path.join(scratch, 'queue', 'failed', 'over-1.json'), 'utf8')).failed_at);
+  assert.notEqual(body.kept_at, '2026-06-01T00:00:00Z');
+  assert.equal(body.kept_reason, 'steps');
+  assert.equal(body.done_file, false);
+  assert.equal(body.fgs_file, false);
+  assert.equal(body.park_file, false);
+  assert.equal(body.parked, true);
+  assert.match(stderr, /retire over-1 \(steps\)|fail_queue steps code=over-1 n=101/);
+  assert.match(stderr, /fail_queue steps code=over-1 n=101/);
+  assert.doesNotMatch(stderr, /fail_queue steps code=park-1/);
+  assert.doesNotMatch(stderr, /fail_queue steps code=done-1/);
+  assert.doesNotMatch(stderr, /fail_queue steps code=fgs-1/);
+});
+
+test('first pass over 100 steps frees the slot for a new challenge and does not start FGS', async () => {
+  const scratch = tmpDir('fgs-steps-live-');
+  const script = path.join(scratch, 'worker.sh');
+  fs.writeFileSync(script, `#!/bin/sh
+id=$(basename "$PWD")
+if [ "$id" = "over-1" ]; then
+  mkdir -p .fgs
+  printf '%s\\n' 101 > .fgs/dsh_step_count
+fi
+exec sleep 120
+`);
+  fs.chmodSync(script, 0o755);
+  const workdir = path.join(scratch, 'work');
+  const run = path.join(scratch, 'run');
+  const fixture = writeFixture(scratch, [
+    {
+      unique_code: 'over-1',
+      description: 'too many steps',
+      is_completed: false,
+      container_addr: ['http://10.8.0.11'],
+    },
+    {
+      unique_code: 'fresh-1',
+      description: 'still new',
+      is_completed: false,
+      container_addr: ['http://10.8.0.12'],
+    },
+  ]);
+  const child = spawn('python3', [driver], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: path.join(repoRoot, 'contest'),
+      PYTHONUNBUFFERED: '1',
+      BENCHMARK_TOKEN: 'test-token',
+      BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+      CONTEST_FIXTURE: fixture,
+      CONTEST_WORKDIR: workdir,
+      RUN: run,
+      CONTEST_DSH_LAUNCH: '0',
+      CONTEST_SUPERVISOR: '1',
+      CONTEST_SUPERVISOR_INTERVAL: '0',
+      CONTEST_MAX_ACTIVE: '1',
+      CONTEST_WORKER_CMD: script,
+      CONTEST_FGS_MODE: 'on_fail',
+      CONTEST_FGS_RETRY_LAST: '1',
+      CONTEST_CHALLENGE_MAX_STEPS: '100',
+      CONTEST_FAIL_ON_BUDGET: '0',
+      SOLVER_GATEWAY: '0',
+    },
+  });
+  let stderr = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for fresh-1\n${stderr}`));
+      }, 15000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (/visit fresh-1 /.test(stderr) && /retire over-1 \(steps\)/.test(stderr)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', () => {
+        if (!/visit fresh-1 /.test(stderr)) {
+          clearTimeout(timer);
+          reject(new Error(`driver exited before fresh-1\n${stderr}`));
+        }
+      });
+    });
+    assert.match(stderr, /contest: retire over-1 \(steps\)/);
+    assert.match(stderr, /contest: fail_queue steps code=over-1 n=101/);
+    assert.match(stderr, /visit fresh-1 .* pass=first/);
+    assert.doesNotMatch(stderr, /pass=fgs/);
+    const fail = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'over-1.json'), 'utf8'));
+    assert.equal(fail.reason, 'steps');
+    assert.ok(fail.failed_at);
+    assert.equal(fs.existsSync(path.join(run, 'queue', 'failed', 'fresh-1.json')), false);
+    const passes = fs.readFileSync(path.join(workdir, 'fresh-1', '.contest', 'passes.jsonl'), 'utf8');
+    assert.match(passes, /"pass": "first"/);
+    assert.doesNotMatch(passes, /"pass": "fgs"/);
+  } finally {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // already gone
+    }
+    for (const code of ['over-1', 'fresh-1']) {
+      try {
+        const launch = JSON.parse(fs.readFileSync(path.join(workdir, code, '.fgs', 'dsh-launch.json'), 'utf8'));
+        if (launch.pid) process.kill(-launch.pid, 'SIGKILL');
+      } catch {
+        // already gone
+      }
+    }
+  }
+});
+
+test('last-round FGS ignores the step cap and the wall-clock budget', async () => {
+  const scratch = tmpDir('fgs-steps-exempt-');
+  const script = path.join(scratch, 'worker.sh');
+  fs.writeFileSync(script, `#!/bin/sh
+mkdir -p .fgs
+printf '%s\\n' 500 > .fgs/dsh_step_count
+exec sleep 120
+`);
+  fs.chmodSync(script, 0o755);
+  const workdir = path.join(scratch, 'work');
+  const run = path.join(scratch, 'run');
+  fs.mkdirSync(path.join(run, 'queue', 'failed'), { recursive: true });
+  fs.mkdirSync(path.join(run, 'queue', 'first_pass_done'), { recursive: true });
+  fs.writeFileSync(path.join(run, 'queue', 'failed', 'redo-1.json'), `${JSON.stringify({
+    unique_code: 'redo-1',
+    failed_at: '2026-01-01T00:00:00Z',
+    reason: 'reap',
+    artifact_dir: '',
+    attempt: 1,
+    problem_id: '',
+    fgs_attempts: 0,
+  }, null, 2)}\n`);
+  fs.writeFileSync(path.join(run, 'queue', 'first_pass_done', 'redo-1'), 'redo-1\n');
+  const fixture = writeFixture(scratch, [{
+    unique_code: 'redo-1',
+    description: 'retry without a cap',
+    is_completed: false,
+    time_budget_min: 0.01,
+    container_addr: ['http://10.8.0.13'],
+  }]);
+  const child = spawn('python3', [driver], {
+    cwd: repoRoot,
+    env: {
+      ...process.env,
+      PYTHONPATH: path.join(repoRoot, 'contest'),
+      PYTHONUNBUFFERED: '1',
+      BENCHMARK_TOKEN: 'test-token',
+      BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+      CONTEST_FIXTURE: fixture,
+      CONTEST_WORKDIR: workdir,
+      RUN: run,
+      CONTEST_DSH_LAUNCH: '0',
+      CONTEST_SUPERVISOR: '1',
+      CONTEST_SUPERVISOR_INTERVAL: '0',
+      CONTEST_MAX_ACTIVE: '1',
+      CONTEST_WORKER_CMD: script,
+      CONTEST_FGS_MODE: 'on_fail',
+      CONTEST_FGS_RETRY_LAST: '1',
+      CONTEST_CHALLENGE_MAX_STEPS: '100',
+      CONTEST_FAIL_ON_BUDGET: '1',
+      CONTEST_SKIP_FGS_SEED: '1',
+      SOLVER_GATEWAY: '0',
+    },
+  });
+  let stderr = '';
+  try {
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`timed out waiting for pass=fgs\n${stderr}`));
+      }, 15000);
+      child.stderr.on('data', (chunk) => {
+        stderr += chunk;
+        if (/pass=fgs/.test(stderr)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      child.on('error', reject);
+      child.on('exit', () => {
+        if (!/pass=fgs/.test(stderr)) {
+          clearTimeout(timer);
+          reject(new Error(`driver exited before pass=fgs\n${stderr}`));
+        }
+      });
+    });
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    assert.match(stderr, /pass=fgs/);
+    assert.doesNotMatch(stderr, /retire redo-1/);
+    assert.doesNotMatch(stderr, /fail_queue steps/);
+    const fail = JSON.parse(fs.readFileSync(path.join(run, 'queue', 'failed', 'redo-1.json'), 'utf8'));
+    assert.equal(fail.reason, 'reap');
+    assert.equal(fail.failed_at, '2026-01-01T00:00:00Z');
+    assert.equal(fail.fgs_attempts, 1);
+  } finally {
+    try {
+      child.kill('SIGKILL');
+    } catch {
+      // already gone
+    }
+    try {
+      const launch = JSON.parse(fs.readFileSync(path.join(workdir, 'redo-1', '.fgs', 'dsh-launch.json'), 'utf8'));
+      if (launch.pid) process.kill(-launch.pid, 'SIGKILL');
+    } catch {
+      // already gone
+    }
+  }
+});

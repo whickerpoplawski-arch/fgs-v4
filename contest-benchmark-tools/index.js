@@ -12,6 +12,7 @@ import {
   submitFlag,
 } from './api.js';
 import { applyLightConstraint } from './light_constraint.js';
+import { applyStepCount } from './step_count.js';
 
 export const name = 'contest-benchmark-tools';
 /** Tools only. Light-constraint hooks use ctx.on; agent comes from the event payload. */
@@ -115,6 +116,9 @@ export function apply(ctx) {
     },
     run: async (args, exec) => jsonResult(recordObservation({ cwd: cwdOf(exec), note: args.note })),
   }));
+
+  const stepDispose = applyStepCount(ctx);
+  if (typeof stepDispose === 'function') disposers.push(stepDispose);
 
   const lightDispose = applyLightConstraint(ctx);
   if (typeof lightDispose === 'function') disposers.push(lightDispose);

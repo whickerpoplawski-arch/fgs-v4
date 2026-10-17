@@ -37,7 +37,8 @@ Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
   { "challenges": [ { "unique_code", "description", "is_completed", "container_addr": [] } ] }
 
 CONTEST_SUPERVISOR defaults on. The loop lives in this process: reap containers
-whose worker died, retire deferred/solved workers after grace, and start the
+whose worker died, retire deferred/solved workers after grace, optionally
+retire a first pass that exceeded CONTEST_CHALLENGE_MAX_STEPS, and start the
 next visit only when both alive workers and active containers are under
 CONTEST_MAX_ACTIVE. It does not exec contest/supervisor/autosup.sh (that is a
 second scheduler for the worker-directory layout).
@@ -65,6 +66,7 @@ from pathlib import Path
 from fail_graph import collect_enrich
 from fail_queue import (
     bump_failed_at,
+    challenge_max_steps,
     discard_unclassified,
     fail_on_budget,
     failure_reason,
@@ -79,8 +81,10 @@ from fail_queue import (
     note_fgs_dispatch,
     park_unclassified,
     plan_budget_retire,
+    plan_steps_retire,
     queue_fgs,
     queue_new,
+    read_step_count,
     register_fail,
     safe_code,
     select_dispatch,
@@ -1225,7 +1229,13 @@ def _code_completed(challenges, code: str) -> bool:
     return False
 
 
-def _enqueue_fail(run: Path, code: str, reason: str, directory: str | None) -> None:
+def _enqueue_fail(
+    run: Path,
+    code: str,
+    reason: str,
+    directory: str | None,
+    step_count: int | None = None,
+) -> None:
     try:
         dest = run / "queue" / "artifacts" / safe_code(code)
         artifact = snapshot_artifacts(Path(directory) if directory else None, dest)
@@ -1246,6 +1256,9 @@ def _enqueue_fail(run: Path, code: str, reason: str, directory: str | None) -> N
         log(f"register_fail {code} failed: {exc}")
         return
     log(f"fail {code} reason={reason}")
+    if reason == "steps":
+        shown = "?" if step_count is None else str(int(step_count))
+        log(f"fail_queue steps code={code} n={shown}")
 
 
 def _mark_done(run: Path, code: str) -> None:
@@ -1344,7 +1357,7 @@ def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *,
     if pass_kind == "fgs":
         _settle_fgs_end(run, code)
         return
-    if state not in ("deferred", "budget"):
+    if state not in ("deferred", "budget", "steps"):
         _mark_done(run, code)
         return
     if list_failed:
@@ -1358,7 +1371,12 @@ def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *,
         except SupervisorError as exc:
             log(f"park {code} failed: {exc}")
         return
-    _enqueue_fail(run, code, state, directory)
+    raw_steps = action.get("step_count")
+    try:
+        step_count = int(raw_steps) if raw_steps is not None else None
+    except (TypeError, ValueError):
+        step_count = None
+    _enqueue_fail(run, code, state, directory, step_count=step_count)
 
 
 def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_path: str) -> int:
@@ -1442,20 +1460,31 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
         retire_actions = plan_retire(views, challenges, now=utc_now(), grace=grace, grace_solved=grace_solved)
         if use_fail_queue:
             seen_codes = {action["code"] for action in retire_actions}
-            budget_views = []
+            capped = []
             for slot in slots:
                 view = slot_view(slot)
                 view["started_at"] = slot.get("started_at")
                 view["budget_min"] = slot.get("budget_min")
-                budget_views.append(view)
+                view["pass_kind"] = slot.get("pass_kind") or "first"
+                view["step_count"] = read_step_count(slot.get("dir"))
+                capped.append(view)
+            for action in plan_steps_retire(
+                capped,
+                challenges,
+                limit=challenge_max_steps(),
+            ):
+                if action["code"] not in seen_codes:
+                    retire_actions.append(action)
+                    seen_codes.add(action["code"])
             for action in plan_budget_retire(
-                budget_views,
+                capped,
                 challenges,
                 now=utc_now(),
                 enabled=fail_on_budget(),
             ):
                 if action["code"] not in seen_codes:
                     retire_actions.append(action)
+                    seen_codes.add(action["code"])
         for action in retire_actions:
             if action["op"] == "hold":
                 append_log(
@@ -1476,7 +1505,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             else:
                 attempted.add(action["code"])
             append_log(run, f"retire {action['code']} ({action['state']})", tag="retire")
-            log(f"retire {action['code']}")
+            log(f"retire {action['code']} ({action['state']})")
         slots = [slot for slot in slots if slot_view(slot)["alive"]]
 
         views = [slot_view(slot) for slot in slots]
