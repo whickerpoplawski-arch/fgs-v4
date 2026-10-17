@@ -101,11 +101,13 @@ from fail_queue import (
 )
 from solver_brief import challenge_fields, render_solver_brief
 from supervisor.core import (
+    ACTIVE_CONTAINER_STATUSES,
     PlatformTransportError,
     SupervisorError,
     acquire_lock,
     append_log,
     archive_worker,
+    challenge_code,
     challenge_url,
     count_active,
     dispatch_budget,
@@ -1155,15 +1157,25 @@ def remember_slot(result: dict) -> dict | None:
     }
 
 
-def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base: str, token: str) -> str:
+def close_slot(
+    run: Path,
+    code: str,
+    already: set[str],
+    fixture_path: str,
+    base: str,
+    token: str,
+    *,
+    retry: bool = False,
+) -> str:
     """Try to close ``code`` once.
 
     Returns ``closed`` on success, ``retry`` when the platform never answered
     (timeout or a dropped connection), ``failed`` on an HTTP answer we will
-    not pin the loop for, and ``skip`` when this code is already closed.
+    not pin the loop for, and ``skip`` when this code is already closed and
+    this call is not a still-active retry.
     A failure is not written to the closed set, so a later tick can try again.
     """
-    if not code or code in already:
+    if not code or (code in already and not retry):
         return "skip"
     try:
         note = perform_close(
@@ -1173,6 +1185,7 @@ def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base:
             token=token,
             fixture=fixture_path or None,
             already=already,
+            retry=retry,
         )
     except PlatformTransportError as exc:
         log(f"close {code} failed: {exc}; pending retry")
@@ -1190,7 +1203,10 @@ def close_slot(run: Path, code: str, already: set[str], fixture_path: str, base:
         return "retry"
     if note is None:
         return "skip"
-    log(f"close {code}")
+    if retry:
+        log(f"close {code} retry (still active after closed.txt)")
+    else:
+        log(f"close {code}")
     return "closed"
 
 
@@ -1537,11 +1553,13 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
     announced = False
     use_fail_queue = fgs_mode() == "on_fail"
 
-    def attempt_close(code: str) -> bool:
-        if not code or code in closed:
+    def attempt_close(code: str, *, retry: bool = False) -> bool:
+        if not code or code in closed_this_tick:
+            return False
+        if code in closed and not retry:
             pending_close.discard(code)
             return False
-        outcome = close_slot(run, code, closed, fixture_path, base, token)
+        outcome = close_slot(run, code, closed, fixture_path, base, token, retry=retry)
         if outcome == "retry":
             pending_close.add(code)
             return False
@@ -1574,17 +1592,25 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 return 0
 
         views = [slot_view(slot) for slot in slots]
+        active_now = set()
+        for item in challenges or []:
+            if isinstance(item, dict) and item.get("container_status") in ACTIVE_CONTAINER_STATUSES:
+                code = challenge_code(item)
+                if code:
+                    active_now.add(code)
         touched: set[str] = set()
         for action in plan_reap(challenges, views, already_closed=closed, include_dead_launched=True):
             if action["op"] == "keep":
                 append_log(run, f"keep {action['code']}")
                 continue
             touched.add(action["code"])
-            attempt_close(action["code"])
+            attempt_close(action["code"], retry=bool(action.get("retry")))
         for code in list(pending_close):
-            if code in touched or code in closed:
+            if code in touched:
                 continue
-            attempt_close(code)
+            if code in closed and code not in active_now:
+                continue
+            attempt_close(code, retry=code in closed and code in active_now)
         if use_fail_queue:
             if list_failed:
                 for slot in slots:
@@ -1637,7 +1663,14 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 except (SupervisorError, OSError) as exc:
                     log(f"snapshot {action.get('code')} failed: {exc}")
             terminate_pid(action.get("pid"))
-            attempt_close(action["code"])
+            retire_code = action["code"]
+            retire_alive = any(
+                item.get("code") == retire_code and slot_view(item)["alive"] for item in slots
+            )
+            attempt_close(
+                retire_code,
+                retry=retire_code in closed and retire_code in active_now and not retire_alive,
+            )
             if action.get("archive") and action.get("dir"):
                 archive_worker(Path(action["dir"]))
             mark_retired(run, action["code"])

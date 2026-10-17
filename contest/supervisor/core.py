@@ -209,11 +209,27 @@ def reap_candidates(challenges, workers, explicit=None, *, include_dead_launched
     return found
 
 
+def still_active_codes(challenges) -> set[str]:
+    """Codes whose platform container still occupies a slot."""
+    found: set[str] = set()
+    for item in challenges or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("container_status") not in ACTIVE_CONTAINER_STATUSES:
+            continue
+        code = challenge_code(item)
+        if code:
+            found.add(code)
+    return found
+
+
 def plan_reap(challenges, workers, codes=None, already_closed=None, *, include_dead_launched: bool = False) -> list[dict]:
     """Close each candidate once when no worker pid is alive. Alive → keep.
 
-    ``already_closed`` suppresses a second close for the same code. Meta state
-    is ignored: a deferred problem whose process is already dead still closes.
+    A code already in ``already_closed`` is skipped only when the list no longer
+    shows it ACTIVE. If it is still ACTIVE and no worker pid is alive, emit
+    another close with ``retry=True``. A live worker is never closed, even when
+    the code is already in closed.txt. Meta state is ignored.
     """
     chosen = reap_candidates(
         challenges,
@@ -227,14 +243,18 @@ def plan_reap(challenges, workers, codes=None, already_closed=None, *, include_d
         for worker in (workers or [])
         if worker.get("alive") and str(worker.get("code") or "").strip()
     }
+    active = still_active_codes(challenges)
     actions = []
     for code in chosen:
-        if code in closed:
-            continue
         if code in alive:
             actions.append({"op": "keep", "code": code})
-        else:
-            actions.append({"op": "close", "code": code})
+            continue
+        if code in closed and code not in active:
+            continue
+        action = {"op": "close", "code": code}
+        if code in closed:
+            action["retry"] = True
+        actions.append(action)
     return actions
 
 
@@ -769,13 +789,27 @@ def close_challenge(base: str, token: str, code: str, prefixes: list[str] | None
     raise SupervisorError(message)
 
 
-def perform_close(run: Path, code: str, *, base: str, token: str, fixture: str | None, already: set[str]) -> str | None:
-    """Close once. Returns the note, or None if this code was already closed.
+def perform_close(
+    run: Path,
+    code: str,
+    *,
+    base: str,
+    token: str,
+    fixture: str | None,
+    already: set[str],
+    retry: bool = False,
+) -> str | None:
+    """Close once. Returns the note, or None when this code was already closed
+    and ``retry`` is false.
+
+    ``retry=True`` posts close again when closed.txt already contains the code
+    but the platform list still shows the container ACTIVE. Success does not
+    append a second closed.txt line.
 
     A transport or HTTP failure is raised and is not recorded. The caller
     retries on a later tick. Recording the code here would leak the slot.
     """
-    if code in already:
+    if code in already and not retry:
         return None
     if fixture:
         note = "fixture"
@@ -783,9 +817,13 @@ def perform_close(run: Path, code: str, *, base: str, token: str, fixture: str |
         _status, payload = close_challenge(base, token, code)
         note = json.dumps(payload, ensure_ascii=False)[:300]
     record_close(run, code, note)
-    mark_closed(run, code)
-    already.add(code)
-    append_log(run, f"close {code} -> {note}")
+    if code not in already:
+        mark_closed(run, code)
+        already.add(code)
+    if retry:
+        append_log(run, f"close {code} retry (still active after closed.txt)")
+    else:
+        append_log(run, f"close {code} -> {note}")
     return note
 
 
