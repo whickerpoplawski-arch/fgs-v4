@@ -190,9 +190,14 @@ test('Solver brief matches the rival e3-02 text', () => {
   assert.equal(result.stdout, expected);
   assert.match(result.stdout, /## 输出纪律/);
   assert.match(result.stdout, /≤2 句/);
+  assert.match(result.stdout, /第 2 句后立刻 tool_call/);
+  assert.match(result.stdout, /无文字直接工具/);
   assert.match(result.stdout, /禁止复述同一结论/);
   assert.match(result.stdout, /最多一句「本题结束」/);
   assert.doesNotMatch(result.stdout, /已达成原语|利用配方|凭证与产物|<Handoff>|收尾契约/);
+  assert.doesNotMatch(result.stdout, /默认中文/);
+  assert.doesNotMatch(result.stdout, /I'll start/);
+  assert.doesNotMatch(result.stdout, /Let me/);
 });
 
 test('A9 profile bundles: baseline has no FGS, contest has FGS and benchmark tools', () => {
