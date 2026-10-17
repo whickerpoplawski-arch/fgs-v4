@@ -8,6 +8,7 @@
 4. **打靶**：用 `bash` / `curl` 打挑战目标。`web_fetch` 会拒私网 IP（`10.0.177.x`）。
 5. **开题**：`POST .../challenges/start?unique_code=`（`unique_code` 放在 query）。`5624fa3` 已经是这个写法。
 6. **交 flag（SCORE）**：baseline（`contest-baseline`，新题默认）用 `benchmark_submit_flag` 一跳 `POST …/challenges/submit`，不经过 `fgs_satisfy_goal`。FGS profile（失败题的二遍，不是墙钟到点）仍把插件 `cordis.patch.yml` 保持 `verifyMode: command`，`verifyCommand` 为 `node ./tools/submit_flag.mjs`；同一 profile 也挂了 `benchmark_*`，Decide 放行这三个工具。禁止用 `regex` 上赛场：`regex` 只检查 fact 里有没有 `flag{…}`，不会 POST submit，SCORE 不涨。每个 worker 由 `launch_dsh` 注入 `FGS_UNIQUE_CODE`（与 start/close 的题号相同）。不要在上传页写一个全局 `FGS_UNIQUE_CODE`。本地练习可以在自己的 profile 里改回 `regex`。
+7. **正式竞赛镜像**：Release [`contest-image-6b5d71f`](https://github.com/whickerpoplawski-arch/fgs-v4/releases/tag/contest-image-6b5d71f) 内置 `@deepseek-ai/dsh@0.2.1-rc.2` 与 [dsh-ops v0.3.1](https://github.com/T-Auto/dsh-ops/releases/tag/v0.3.1)（`dsh-ops-shell` / `dsh-ops-file` / `dsh-ops-background` / `dsh-ops-ptc` 全开）。Messages 仍是 `deepseek-official` + `/anthropic`，并且 **`thinking: enabled`**。这不是 `dsh plugin add` 本仓库能装出来的。详见「[正式竞赛镜像](#contest-image-release)」。
 
 ---
 
@@ -85,9 +86,9 @@ grep -n 'fgs-deepseek-dsh' ~/.dsh/profiles/web/package.json
 
 ## 「托管容器额外要求」
 
-只把本插件装进自己的 DeepSeek harness（`dsh plugin add`，包进入 profile 的 `dependencies` 和 `dsh.profile.bundles`）只提供 **FGS 工具和黑板**。没有 contest driver，reap / retire 不会跑。
+只把本插件装进自己的 DeepSeek harness（`dsh plugin add`，包进入 profile 的 `dependencies` 和 `dsh.profile.bundles`）只提供 **FGS 工具和黑板**。没有 contest driver，reap / retire 不会跑。已发布的竞赛镜像另含 dsh 0.2.1-rc.2 与 dsh-ops v0.3.1，见「[正式竞赛镜像](#contest-image-release)」。`dsh plugin add` 本插件不安装 dsh-ops，也不依赖它。
 
-Installing this plugin into a profile bundle only provides the **FGS tools and the blackboard**. That install does not start the contest driver.
+Installing this plugin into a profile bundle only provides the **FGS tools and the blackboard**. That install does not start the contest driver. The published contest image also contains dsh 0.2.1-rc.2 and dsh-ops v0.3.1; `dsh plugin add` of this plugin does not install dsh-ops and does not require it (see 「正式竞赛镜像」).
 
 TSecBench 托管容器在插件之外还要：
 
@@ -151,12 +152,7 @@ fgs_seed → 「已经种过题」并报错
 不在 `ROLE_TOOLS.decide ∪ decideAllowTools` 里的工具一律拒（含 `bash`/文件/`web_*`/
 `subagent`/`workflow`，因为它们能间接执行环境动作）。Execute 轮拒 Decide 的规划类工具。
 
-> 为什么不用 `tools.restrict` 做 schema 级隐藏：实测（DSH 0.2.0-rc.2）对同一 agent scope
-> 连续 `restrict` 时后一次不会解除前一次的限制（限制取交集）。角色随图状态变化，一旦
-> 为「未启动」隐藏了规划工具，进入 Decide 后它们就再也不可见了。所以 schema 层永远保留
-> 全部 `fgs_*` 工具，越权由 guard 硬拒。`tests/plugin.test.mjs` 有回归用例锁住这一点。
-
-> 为什么不用 `tools.restrict` 做 schema 级隐藏：实测（DSH 0.2.0-rc.2）对同一 agent scope
+> 为什么不用 `tools.restrict` 做 schema 级隐藏：实测于 DSH **0.2.0-rc.2**（历史记录。当前已发布竞赛镜像的 dsh 是 0.2.1-rc.2，restrict 交集行为没有在 0.2.1 上复测）。对同一 agent scope
 > 连续 `restrict` 时后一次不会解除前一次的限制（限制取交集）。角色随图状态变化，一旦
 > 为「未启动」隐藏了规划工具，进入 Decide 后它们就再也不可见了。所以 schema 层永远保留
 > 全部 `fgs_*` 工具，越权由 guard 硬拒。`tests/plugin.test.mjs` 有回归用例锁住这一点。
@@ -339,7 +335,7 @@ stdout 一行 JSON：`status` 为 `seeded` 或 `already-seeded`。
 
 ### 镜像
 
-示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。dsh 需要在正式镜像里另装。Dockerfile 把 `profiles/contest-baseline` 和 `profiles/contest` 拷到 `$DSH_HOME/profiles/`，并把默认 profile 设成 `contest-baseline`。上传页环境见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)。
+示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。这个示例骨架不安装 dsh，也不安装 dsh-ops。它把仓库里的 `profiles/contest-baseline` 和 `profiles/contest` 拷到 `$DSH_HOME/profiles/`（这两份仍是 `thinking: disabled`），并把默认 profile 设成 `contest-baseline`。`docker build -f contest/Dockerfile` 得到的镜像与下面的正式包是两份东西。正式 tarball 见「[正式竞赛镜像（Release）](#contest-image-release)」。上传页环境见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)。
 
 ```bash
 docker build -f contest/Dockerfile -t fgs-contest .
@@ -350,6 +346,18 @@ docker build -f contest/Dockerfile -t fgs-contest .
 ```bash
 node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests/contest_supervisor.test.mjs tests/contest_baseline.test.mjs tests/contest_fail_then_fgs.test.mjs tests/contest_light_constraint.test.mjs
 ```
+
+<a id="contest-image-release"></a>
+
+### 正式竞赛镜像（Release）
+
+当前正式包是 Release [`contest-image-6b5d71f`](https://github.com/whickerpoplawski-arch/fgs-v4/releases/tag/contest-image-6b5d71f)，对应提交 `6b5d71f2bcb684b452998316adc27fb7b56ba29e`。下载 [`agent.tar.gz`](https://github.com/whickerpoplawski-arch/fgs-v4/releases/download/contest-image-6b5d71f/agent.tar.gz)。SHA256 `e1713e1485e1fccf3361b452823efaa79779ce3fc0fbe0dbcf32f3b260634ccf`。
+
+- dsh：`@deepseek-ai/dsh@0.2.1-rc.2`（上一份正式烘包是 `0.2.0-rc.2`）。
+- dsh-ops：[v0.3.1](https://github.com/T-Auto/dsh-ops/releases/tag/v0.3.1)。四个组件都开着：`dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc`。烟囱里点过名的工具是 `ops_bash`、`ops_glob`、`ops_inspect_local_file`。`contest-baseline` 和 `contest` 都有这些 ops 工具；只有 `contest` 有 FGS。
+- Messages 仍是 `deepseek-official` + `https://api.deepseek.com/anthropic`。这份镜像上 **`thinking: enabled`**。dsh 0.2.1-rc.2 在 `thinking: disabled` 时会 TRANSPORT 失败。
+
+本仓库的 `profiles/contest/cordis.patch.yml` 和 `profiles/contest-baseline/cordis.patch.yml` 仍写 `thinking: disabled`，也没有 dsh-ops。`contest/Dockerfile` 是示例骨架：不安装 dsh，也不安装 dsh-ops，拷贝的是仓库里的这两份 profile。`docker build -f contest/Dockerfile` 不会得到上面的 `agent.tar.gz`。dsh-ops 不是 `@local/fgs-deepseek-dsh` 的依赖，也不是 npm 包。`dsh plugin add` 本仓库不会装上它。
 
 ## 契约对照
 
