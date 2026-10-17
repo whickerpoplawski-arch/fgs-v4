@@ -111,6 +111,8 @@ export function roleContextText({
 
 export function roleLabel(role) {
   if (role === 'decide') return 'Decide（只做规划/改图，禁止环境执行工具）';
-  if (role === 'execute') return 'Execute（只推进一个 open step，禁止规划类改图工具）';
+  if (role === 'execute') {
+    return 'Execute（只推进一个 open step；goal 级判断由 Decide 独占，图操作工具两类活动都可用）';
+  }
   return 'off（未启动 FGS 运行）';
 }

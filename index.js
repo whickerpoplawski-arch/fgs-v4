@@ -56,7 +56,7 @@ export const PLUGIN_GENERATION = 12;
 export const BUILD_TAG = '12+cairn-v2+commit-per-step+orphan-visibility'
   + '+readonly-decide-tools+claim-opened+ctx-budget+egress-tools'
   + '+draft-no-loss+cap-in-forceclose+exec-ttl+schema-ux+role-prompt'
-  + '+benchmark-allow+ttl-conclude';
+  + '+benchmark-allow+ttl-conclude+fact-gate';
 
 /** 本插件只硬依赖 tools；其余服务可选接入。 */
 export const inject = ['tools'];
@@ -229,8 +229,12 @@ const DEFAULT_CONFIG = Object.freeze({
   // stepDraftTtlMs = 未收束草稿的存活上限；超期在 refreshRole 时清理，防僵尸草稿。
   stepLeaseMs: 30 * 60 * 1000,
   stepDraftTtlMs: 60 * 60 * 1000,
-  // 单题 Execute 会话墙钟。与 stepLeaseMs（认领租约）正交：到期写未完成 Fact 并释放认领。
+  // 单题 Execute 会话墙钟。与 stepLeaseMs（认领租约）正交：到期进入 conclude，
+  // 用一条 Fact 关掉当前 step，不把题目标成 deferred。
   executeSessionTtlMs: 10 * 60 * 1000,
+  // 没有 Fact 草稿时，Execute 最多再调用这么多次环境工具，然后必须 fgs_submit_fact。
+  // 出现 execDraft 时计数归零。默认 8：拦住 bash∶submit_fact ≈ ∞∶0，仍留一轮探查。
+  executeEnvCallsBeforeFact: 8,
   // v2：Finding = 搜索过程的结构化产物；类型**可动态定义**。
   // 留空数组 = 不限制取值（自由定义）；给定 = 白名单。
   findingTypes: [],
@@ -571,6 +575,7 @@ function createRun(agent, cfg, registry, problemId) {
     registry,
     executeStartedAt: null,
     executePhase: null,
+    envCallsSinceFact: 0,
   };
 }
 
@@ -936,21 +941,96 @@ function shouldSkipAutoClaim(registry, problemId) {
   return views.some((view) => view.workable);
 }
 
-function describeTried(run, step) {
+function triedClause(run, step) {
   const draft = run.execDraft;
   if (draft && (!draft.stepId || draft.stepId === step.id)) {
     const title = clipChars(draft.title, 80) || '(无标题)';
-    const content = clipChars(draft.content, 500);
-    return `已试：${title}${content ? ` — ${content}` : ''}`;
+    const content = clipChars(draft.content, 240);
+    return `${title}${content ? ` — ${content}` : ''}`;
   }
   const expired = Array.isArray(run.expiredDrafts)
     ? run.expiredDrafts.filter((d) => !d.stepId || d.stepId === step.id)
     : [];
   if (expired.length > 0) {
     const last = expired[expired.length - 1];
-    return `已试：${clipChars(last.title, 80) || '(无标题)'} — ${clipChars(last.content, 500)}`;
+    return `${clipChars(last.title, 80) || '(无标题)'} — ${clipChars(last.content, 240)}`;
   }
-  return '已试：没有未提交草稿。';
+  const n = Number(run.envCallsSinceFact) || 0;
+  return n > 0
+    ? `环境工具 ${n} 次，没有可保留的草稿。`
+    : '没有可保留的草稿。';
+}
+
+/** 收束 Fact 正文固定三栏。禁止用空话当整段 Fact。 */
+function structuredCloseBody({ confirmed, tried, stuck }) {
+  return `已确认：${confirmed}\n已试：${tried}\n卡在：${stuck}`;
+}
+
+function fallbackObservation(step, { title, confirmed, tried, stuck }) {
+  return {
+    title: clipChars(title, 120),
+    content: structuredCloseBody({ confirmed, tried, stuck }),
+    stepId: step.id,
+    findingType: null,
+  };
+}
+
+function hasExpiredDraftFor(run, stepId) {
+  if (!Array.isArray(run.expiredDrafts) || run.expiredDrafts.length === 0) return false;
+  return run.expiredDrafts.some((d) => !stepId || !d.stepId || d.stepId === stepId);
+}
+
+function executeEnvCap(cfg) {
+  const n = Number(cfg?.executeEnvCallsBeforeFact ?? DEFAULT_CONFIG.executeEnvCallsBeforeFact);
+  if (!Number.isFinite(n)) return DEFAULT_CONFIG.executeEnvCallsBeforeFact;
+  return Math.max(0, Math.floor(n));
+}
+
+/** 环境工具 = 既不是图工具、也不是 Decide 白名单（出站/只读/竞赛交分）的调用。 */
+function isExecuteEnvTool(cfg, tool) {
+  if (!tool || typeof tool !== 'string') return false;
+  if (PROJECT_TOOLS.includes(tool) || GRAPH_TOOL_NAMES.includes(tool)) return false;
+  if (decideAllows(cfg, tool)) return false;
+  return true;
+}
+
+/**
+ * 没有草稿时，环境工具调用计到 executeEnvCallsBeforeFact 就停。
+ * 有 execDraft 则计数归零并放行（草稿还在，收束会保住它）。
+ * 返回拒绝文案，或 null 表示放行。
+ */
+function executeFactGate(run, tool) {
+  if (run.execDraft) {
+    run.envCallsSinceFact = 0;
+    return null;
+  }
+  const cap = executeEnvCap(run.cfg);
+  const used = Number(run.envCallsSinceFact) || 0;
+  if (used >= cap) {
+    return `FGS Execute 在没有 Fact 草稿时已调用环境工具 ${used} 次`
+      + `（上限 executeEnvCallsBeforeFact=${cap}），拒绝 ${tool}。`
+      + '先 fgs_submit_fact 写下已确认、已试、卡在，再继续；'
+      + '或进入收束 conclude 后 fgs_commit_step 关闭本 step。不要继续空转环境工具。';
+  }
+  run.envCallsSinceFact = used + 1;
+  return null;
+}
+
+function unclaimedOpenSteps(graph) {
+  return openStepsOf(graph).filter((step) => !stepOwnerOf(step));
+}
+
+/**
+ * 本会话没有持有的 open step，且图上已有未认领 open step → 必须先 claim。
+ * 仅有 fact_origin、没有 open step 时返回 null（冷启动仍可开一条）。
+ */
+function claimFirstBlock(run, graph) {
+  if (openStepsOf(graph).some((step) => stepOwnerOf(step) === run.sid)) return null;
+  const free = unclaimedOpenSteps(graph);
+  if (free.length === 0) return null;
+  const ids = free.map((step) => step.id).join(', ');
+  return `图上已有未认领 open step（${ids}）。本会话没有持有的 step，拒绝 fgs_open_step。`
+    + '先 fgs_claim_step 接手已有 step，不要再开一条。';
 }
 
 function unfinishedLines(graph) {
@@ -1080,15 +1160,12 @@ function concludeFactDraft(run, step) {
   }
   const expired = takeExpiredDraft(run, step.id);
   if (expired) return expiredDraftAsFact(expired, step.id);
-  return {
-    title: clipChars(`${step.id} 收束`, 120),
-    content: [
-      describeTried(run, step),
-      '探索时限到了，已确认的增量在此收束。',
-    ].join('\n'),
-    stepId: step.id,
-    findingType: null,
-  };
+  return fallbackObservation(step, {
+    title: `${step.id} 收束`,
+    confirmed: '探索时限到了，本步没有另写已确认增量。',
+    tried: triedClause(run, step),
+    stuck: `${step.id} ${clipChars(step.action ?? '', 80)}`,
+  });
 }
 
 /** 同会话收束：一条普通 Fact + 关闭 step。不写未完成 Fact，不把题目标成 deferred。 */
@@ -1131,6 +1208,7 @@ function finishExecuteSession(run, stepId) {
   }
   run.executeStartedAt = null;
   run.currentStepId = null;
+  run.envCallsSinceFact = 0;
   run.role = 'decide';
   run.dispatch = 'claimable';
 }
@@ -1647,6 +1725,8 @@ function registerTools(ctx, cfg, runs, registries, detached) {
     },
     run: (args, exec) => {
       const run = active(exec);
+      const blocked = claimFirstBlock(run, run.store.load());
+      if (blocked) return fail(blocked);
       const op = openStepOp({
         action: args.action ?? '',
         from: args.from ?? [],
@@ -1881,6 +1961,10 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       }
       if (!ops || ops.length === 0) return fail('草稿为空，且未提供 operations[]；没有可提交的改动。');
       const graph = run.store.load();
+      if (ops.some((op) => op.type === 'open_step')) {
+        const blocked = claimFirstBlock(run, graph);
+        if (blocked) return fail(blocked);
+      }
       const applied = [];
       let working = graph;
       for (const op of ops) {
@@ -2003,6 +2087,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       }
       run.execDraft = { title, content, stepId: step.id, findingType };
       run.execDraftAt = Date.now();
+      run.envCallsSinceFact = 0;
       return ok(`已记入本轮草稿: producedBy=${step.id}。结束时调用 fgs_commit_step 收束。`);
     },
   }));
@@ -2056,11 +2141,12 @@ function registerTools(ctx, cfg, runs, registries, detached) {
       }
       const expiredDraft = run.execDraft ? null : takeExpiredDraft(run, step.id);
       const draft = run.execDraft
-        ?? (expiredDraft ? expiredDraftAsFact(expiredDraft, step.id) : {
+        ?? (expiredDraft ? expiredDraftAsFact(expiredDraft, step.id) : fallbackObservation(step, {
           title: `${step.id} 无有效产出（观察）`,
-          content: `step ${step.id} 结束前没有 fgs_submit_fact；按契约 §5 落一条显式观察 Fact。`,
-          stepId: step.id,
-        });
+          confirmed: '本步结束前没有模型提交的草稿。',
+          tried: triedClause(run, step),
+          stuck: `${step.id} ${clipChars(step.action ?? '', 80)}`,
+        }));
       const op = submitFactOp({
         title: draft.title,
         content: draft.content,
@@ -2073,6 +2159,7 @@ function registerTools(ctx, cfg, runs, registries, detached) {
         run.execDraft = null;
         run.execDraftAt = null;
         run.currentStepId = null;
+        run.envCallsSinceFact = 0;
         if (limited) {
           // v3：按 (round, stepId) 记账，而不是「本回合已用完额度」。
           run.committedRound = round;
@@ -2263,11 +2350,12 @@ function forceCloseStep(run, turn, registry) {
   }
   const expiredDraft = run.execDraft ? null : takeExpiredDraft(run, step.id);
   const draft = run.execDraft
-    ?? (expiredDraft ? expiredDraftAsFact(expiredDraft, step.id) : {
+    ?? (expiredDraft ? expiredDraftAsFact(expiredDraft, step.id) : fallbackObservation(step, {
       title: `${step.id} 无有效产出（观察）`,
-      content: `回合结束前没有 fgs_submit_fact；按契约 §5 强制落一条显式观察 Fact。`,
-      stepId: step.id,
-    });
+      confirmed: '回合结束前没有模型提交的草稿。',
+      tried: triedClause(run, step),
+      stuck: `${step.id} ${clipChars(step.action ?? '', 80)}`,
+    }));
   const next = run.controller.apply(
     submitFactOp({ title: draft.title, content: draft.content, producedBy: step.id, findingType: draft.findingType ?? null }),
     graph,
@@ -2276,6 +2364,7 @@ function forceCloseStep(run, turn, registry) {
   run.execDraft = null;
   run.execDraftAt = null;
   run.currentStepId = null;
+  run.envCallsSinceFact = 0;
   if (limited) {
     run.committedRound = round;
     if (!(run.committedStepIds instanceof Set)) run.committedStepIds = new Set();
@@ -2414,6 +2503,10 @@ export function apply(ctx, config = {}) {
           + ` 需要在环境里动作时，先 fgs_open_step + fgs_commit 打开 step，进 Execute 轮再执行。\n${DECIDE_ENV_NEXT}`;
       }
     }
+    if (run && run.role === 'execute' && isExecuteEnvTool(cfg, tool)) {
+      const blocked = executeFactGate(run, tool);
+      if (blocked) return blocked;
+    }
     return undefined;
   }));
 
@@ -2447,15 +2540,22 @@ export function apply(ctx, config = {}) {
       try {
         if (!run || run.role !== 'execute') continue;
         if (!run.currentStepId && !run.execDraft) continue;
-        if (!run.execDraft) {
-          // 没有草稿时**不要**假装"无有效产出"（那会误导：本轮可能已经拿到 flag）。
-          // 落一条诚实的中断记录，把真相指向平台侧。
+        // 已有草稿（含过期后仍保留的正文）一律原样收束，信号不得覆盖。
+        // conclude 阶段也不塞中断占位：交给 concludeFactDraft 写三栏收束 Fact。
+        const concluding = run.executePhase === 'conclude' || executeExpired(run, sessionNow(run));
+        if (!run.execDraft && !hasExpiredDraftFor(run, run.currentStepId) && !concluding) {
+          const stepId = run.currentStepId ?? 'step';
           run.execDraft = {
-            title: `${run.currentStepId ?? 'step'} 被 ${sig} 中断（信号兜底收束）`,
-            content: `进程收到 ${sig} 即将退出，本 step 未经模型收束。`
-              + '为不让黑板留空，此处落一条显式记录；本轮真实进展以平台侧进度为准。',
+            title: clipChars(`${stepId} 被 ${sig} 中断（信号兜底收束）`, 120),
+            content: structuredCloseBody({
+              confirmed: `进程收到 ${sig}，当时没有可保留的草稿正文。`,
+              tried: triedClause(run, { id: stepId }),
+              stuck: `${stepId}，由信号兜底关闭。`,
+            }),
             stepId: run.currentStepId,
+            findingType: null,
           };
+          run.execDraftAt = Date.now();
         }
         // turn 传 undefined → observeRound 返回 limited:false，跳过"一轮一步"守卫；
         // registry 传 null → syncProjectMeta 开头会直接 return，不会 NPE。

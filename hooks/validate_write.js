@@ -12,6 +12,16 @@ import { OP, WriteRejected } from '../controller/ops.js';
 /** 预检调用计数：给测试断言「Controller 确实过了这道 hook」，而不是只在内部重复校验。 */
 export const preflightStats = { calls: 0 };
 
+/**
+ * drop 必须引用图上已有 Fact（fact_origin 或 fact_NNN）。
+ * 词边界避开 artifact_001 这类子串误放行。
+ */
+export function dropReasonCitesFact(reason) {
+  const text = String(reason ?? '');
+  return /(?:^|[^A-Za-z0-9])fact_origin\b/.test(text)
+    || /(?:^|[^A-Za-z0-9])fact_\d+\b/.test(text);
+}
+
 /** apply 前快速结构检查；失败抛 WriteRejected。 */
 export function preflight(op) {
   preflightStats.calls += 1;
@@ -24,6 +34,11 @@ export function preflight(op) {
     case OP.DROP_STEP:
       if (!hasText(op.reason)) {
         throw new WriteRejected('drop_step 缺 reason（拒收，CONTRACT §4）');
+      }
+      if (!dropReasonCitesFact(op.reason)) {
+        throw new WriteRejected(
+          'drop_step 的 reason 必须包含 fact_origin 或 fact_NNN（拒收：丢弃必须引用图上已有 Fact）',
+        );
       }
       return;
     case OP.SATISFY_GOAL:

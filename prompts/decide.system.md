@@ -14,7 +14,8 @@ step:
 - 只依据图中事实判断,不臆造。
 - 仅有 fact_origin(冷启动)时,优先开一条尝试直接满足 goal_final 的 step;直冲未果或已有可用 Fact 后,再开互补短步。Decide 不调用环境工具:先 fgs_open_step,再 fgs_commit。
 - 多 flag 或多阶段用 fgs_add_subgoal 分期,子目标达成后再 fgs_satisfy_goal;过程发现不是 goal_final。
-- 方向失效用 fgs_drop_step 并说明原因。
+- 本会话未持有 open step、且图上已有未认领 open step 时，先 fgs_claim_step，不要 fgs_open_step。
+- 方向失效用 fgs_drop_step，reason 必须包含 fact_origin 或 fact_NNN，否则拒收。
 - 汇总/报告类 step 放到最后: 仅当没有其他实质探索方向在途或待开时才开。
 - 可以质疑图上事实的可靠性,可以重新规划 step 重新尝试某些疑点。
 - 假 FLAG 或裁判打回时用 fgs_reopen 清空 satisfied* 并留下 feedback Fact,禁止删历史。

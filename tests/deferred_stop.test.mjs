@@ -93,19 +93,23 @@ test('未 deferred 时 open → commit → 环境工具 → 收束仍然放行',
   assert.equal(agent.concluded, false);
 });
 
-test('TTL 前环境工具不设次数门；到期后停环境工具，commit_step 关 step 并回到 Decide', async () => {
+test('TTL 前环境工具有 Fact 草稿上限；到期后停环境工具，commit_step 关 step 并回到 Decide', async () => {
   const clock = { now: 1_700_000_000_000 };
   const { host, agent, cwd, fgs } = boot({ now: () => clock.now });
   const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  assert.doesNotMatch(src, /maxEnvCalls|envCallLimit|环境工具次数/);
+  assert.match(src, /executeEnvCallsBeforeFact:\s*8/);
   await seedProject(host, agent, fgs, 'alpha', 'alpha-brief');
   await openOwned(host, agent, '探测端口');
 
-  for (let i = 0; i < 9; i += 1) {
+  for (let i = 0; i < 8; i += 1) {
     const live = await host.callTool('bash', {}, agent);
     assert.equal(live.ok, true, live.text);
     assert.equal(live.text, 'bash ok');
   }
+  const capped = await host.callTool('bash', {}, agent);
+  assert.equal(capped.ok, false, capped.text);
+  assert.match(capped.text, /fgs_submit_fact/);
+  assert.doesNotMatch(capped.text, /deferred/);
   assert.equal(agent.concluded, false);
   assert.equal(graphOf(cwd, 'alpha').steps[0].state, 'open');
 

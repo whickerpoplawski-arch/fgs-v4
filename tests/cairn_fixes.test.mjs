@@ -277,7 +277,7 @@ test('v2：图只追加——drop_step / drop_subgoal 都不减少节点数', as
 
   // 本会话已认领 A；显式 drop 掉 B（B 仍是 open）
   assert.equal((await host.callTool('fgs_drop_step', {
-    stepId: 'step_002', reason: '死胡同',
+    stepId: 'step_002', reason: '死胡同，见 fact_origin',
   }, agent)).ok, true);
   assert.equal((await host.callTool('fgs_commit', {}, agent)).ok, true);
   const c2 = count();

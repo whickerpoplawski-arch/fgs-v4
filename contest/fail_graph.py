@@ -233,12 +233,21 @@ def collect_enrich(artifact_dir: str | Path | None, *, reason: str = "") -> dict
             "evidence": summaries[0].split(":", 1)[0],
         })
 
+    verified_titles = [
+        _title("已验证: ", row["note"])
+        for row in observations
+        if _kind(row["note"]) == "verified"
+    ]
+    action = "基于已有原语继续利用并提交 flag。先读已验证事实，不要重走已排除路径。"
+    if verified_titles:
+        action = f"{action} 引用最新已验证：{verified_titles[-1]}"
+
     return {
         "empty": False,
         "note": facts[0]["content"],
         "facts": facts[:_MAX_FACTS],
         "intent": {
-            "action": "基于已有原语继续利用并提交 flag。先读已验证事实，不要重走已排除路径。",
+            "action": action,
             "priority": "high",
         },
         "sources": sources,
