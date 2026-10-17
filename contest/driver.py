@@ -14,9 +14,14 @@ the old wall-clock switch (``CONTEST_FGS_AFTER_SEC``) and does not retry.
 The choice is per new worker. A running worker is not hot-swapped. It is
 killed to change profiles only when a baseline's pre-step count exceeds
 ``CONTEST_CHALLENGE_FGS_AFTER_STEPS`` and an FGS slot is free (promote). That
-relaunch stays on the same workdir, does not enter ``failed/``, and does not
-close the container. The step cap still retires a baseline and that mid-round
-FGS; only a fail-queue last round is exempt.
+relaunch stays on the same workdir, keeps ``.fgs/dsh_step_count`` so the cap
+stays absolute, does not enter ``failed/``, and does not close the container.
+When no FGS slot is free, a baseline still inside ``(AFTER, MAX]`` is a
+slot-busy fail (``reason=fgs_slot_busy``): snapshot ``queue/artifacts/``,
+kill, enqueue only after the process is dead, and close. Same-tick order is
+step retire past ``MAX``, then promote up to the free room, then slot-busy.
+The step cap retires a baseline and that mid-round FGS at the same absolute
+``N``; only a fail-queue last round is exempt.
 
 `dsh` is not vendored here. Unless CONTEST_DSH_LAUNCH=1 and `dsh` is on PATH,
 the launch step records a stub under `.fgs/dsh-launch.json`.
@@ -43,11 +48,11 @@ Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
 CONTEST_SUPERVISOR defaults on. The loop lives in this process: reap containers
 whose worker died, retire deferred/solved workers after grace, optionally
 retire a worker that exceeded CONTEST_CHALLENGE_MAX_STEPS (not a fail-queue
-last round), optionally promote a baseline past CONTEST_CHALLENGE_FGS_AFTER_STEPS,
-and start the
-next visit only when both alive workers and active containers are under
-CONTEST_MAX_ACTIVE. It does not exec contest/supervisor/autosup.sh (that is a
-second scheduler for the worker-directory layout).
+last round), promote baselines past CONTEST_CHALLENGE_FGS_AFTER_STEPS while
+an FGS slot is free, slot-busy the other baselines still inside that window,
+and start the next visit only when both alive workers and active containers
+are under CONTEST_MAX_ACTIVE. It does not exec contest/supervisor/autosup.sh
+(that is a second scheduler for the worker-directory layout).
 
 A platform list/start/close timeout or a dropped connection is logged and the
 loop keeps ticking. Close is retried on a later tick and is not recorded as
@@ -87,7 +92,7 @@ from fail_queue import (
     note_fgs_dispatch,
     park_unclassified,
     plan_budget_retire,
-    plan_promote,
+    plan_slot_busy,
     plan_steps_retire,
     promote_after_steps,
     queue_fgs,
@@ -1283,9 +1288,9 @@ def _enqueue_fail(
         log(f"register_fail {code} failed: {exc}")
         return
     log(f"fail {code} reason={reason}")
-    if reason == "steps":
+    if reason in ("steps", "fgs_slot_busy"):
         shown = "?" if step_count is None else str(int(step_count))
-        log(f"fail_queue steps code={code} n={shown}")
+        log(f"fail_queue {reason} code={code} n={shown}")
 
 
 def _mark_done(run: Path, code: str) -> None:
@@ -1435,17 +1440,6 @@ def _challenge_for(challenges, code: str) -> dict | None:
     return None
 
 
-def _clear_step_count(directory: str | None) -> None:
-    """Drop the sidecar so the next process on this same cwd counts from 0."""
-    if not directory:
-        return
-    path = Path(directory) / ".fgs" / "dsh_step_count"
-    try:
-        path.unlink()
-    except OSError:
-        return
-
-
 def promote_enrich_dir(run: Path, code: str) -> Path:
     """Enrich copy for a promote. Never the fail-queue artifact directory."""
     return Path(run) / "queue" / "promote_enrich" / safe_code(code)
@@ -1466,61 +1460,111 @@ def _drop_tree(path: Path) -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def apply_promotes(run: Path, slots: list[dict], challenges, *, room: int, skip_codes: set[str]) -> list[dict]:
-    """Snapshot, kill, and schedule a same-cwd FGS relaunch for baselines past the promote line.
+def _retire_slot_busy(run: Path, slot: dict, action: dict, *, close) -> bool:
+    """Snapshot, kill, and enqueue a baseline that wanted FGS while the slot was full.
 
-    Returns visit plans. Does not write ``failed/``, does not close the
-    container, and does not consume an FGS retry. ``room`` is how many FGS
-    slots are free; a full slot leaves the baseline running. A process that
-    is still alive after ``terminate_pid`` is not relaunched.
+    Enqueue and close run only after the process is dead. A kill that does
+    not stick drops the snapshot and leaves the worker running. Does not
+    write ``promote_enrich/`` and does not call ``note_fgs_dispatch``.
     """
-    if room <= 0:
-        return []
+    code = str(action.get("code") or "").strip()
+    if not code:
+        return False
+    directory = str(action.get("dir") or slot.get("dir") or "")
+    try:
+        dest = run / "queue" / "artifacts" / safe_code(code)
+    except SupervisorError as exc:
+        log(f"slot_busy {code} skipped: {exc}")
+        return False
+    try:
+        snapshot_artifacts(Path(directory) if directory else None, dest)
+    except (SupervisorError, OSError) as exc:
+        log(f"snapshot {code} failed: {exc}")
+    terminate_pid(action.get("pid"))
+    if slot_view(slot)["alive"]:
+        _drop_tree(dest)
+        log(f"slot_busy {code} skipped (still alive)")
+        return False
+    raw_steps = action.get("step_count")
+    try:
+        step_count = int(raw_steps) if raw_steps is not None else None
+    except (TypeError, ValueError):
+        step_count = None
+    reason = str(action.get("reason") or "fgs_slot_busy")
+    _enqueue_fail(run, code, reason, directory, step_count=step_count)
+    append_log(run, f"retire {code} (fgs_slot_busy)", tag="retire")
+    log(f"retire {code} (fgs_slot_busy)")
+    if close is not None:
+        close(code)
+    return True
+
+
+def apply_promotes(
+    run: Path,
+    slots: list[dict],
+    challenges,
+    *,
+    room: int,
+    skip_codes: set[str],
+    close=None,
+) -> list[dict]:
+    """Promote baselines past AFTER up to ``room``, then slot-busy the rest.
+
+    Promote reuses the cwd, keeps ``.fgs/dsh_step_count``, writes
+    ``queue/promote_enrich/<code>/``, and does not close or enter ``failed/``.
+    Baselines still in ``(AFTER, MAX]`` after those promotes (including when
+    ``room`` is 0) are slot-busy fails: snapshot ``queue/artifacts/<code>/``,
+    kill, and only then register ``fgs_slot_busy``, mark the first pass done,
+    and close. A process that is still alive after ``terminate_pid`` is not
+    relaunched and is not enqueued. Does not consume an FGS retry.
+    """
     after = promote_after_steps()
     limit = challenge_max_steps()
     if after <= 0:
         return []
-    actions = plan_promote(
+    actions = plan_slot_busy(
         [_cap_view(slot) for slot in slots],
         challenges,
         after=after,
         limit=limit,
         skip_codes=skip_codes,
     )
+    room_left = max(0, int(room))
     plans = []
     doomed: list[dict] = []
     for action in actions:
-        if len(plans) >= room:
-            break
         code = str(action.get("code") or "")
         slot = next((item for item in slots if item.get("code") == code), None)
         if slot is None or not slot_view(slot)["alive"]:
             continue
-        challenge = _challenge_for(challenges, code)
-        if challenge is None:
+        if len(plans) < room_left:
+            challenge = _challenge_for(challenges, code)
+            if challenge is None:
+                continue
+            directory = str(action.get("dir") or slot.get("dir") or "")
+            dest = promote_enrich_dir(run, code)
+            artifact = _copy_fresh_snapshot(directory, dest)
+            terminate_pid(action.get("pid"))
+            if slot_view(slot)["alive"]:
+                _drop_tree(dest)
+                log(f"promote {code} skipped (still alive)")
+                continue
+            doomed.append(slot)
+            plans.append({
+                "challenge": challenge,
+                "pass_kind": "fgs",
+                "code": code,
+                "record": {"artifact_dir": artifact, "reason": "promote"},
+                "promote": True,
+                "from_fail_queue": False,
+                "reuse_ok": True,
+                "dir": directory,
+            })
+            log(f"promote {code} n={int(action['step_count'])}")
+            append_log(run, f"promote {code} n={int(action['step_count'])}")
             continue
-        directory = str(action.get("dir") or slot.get("dir") or "")
-        dest = promote_enrich_dir(run, code)
-        artifact = _copy_fresh_snapshot(directory, dest)
-        terminate_pid(action.get("pid"))
-        if slot_view(slot)["alive"]:
-            _drop_tree(dest)
-            log(f"promote {code} skipped (still alive)")
-            continue
-        _clear_step_count(directory)
-        doomed.append(slot)
-        plans.append({
-            "challenge": challenge,
-            "pass_kind": "fgs",
-            "code": code,
-            "record": {"artifact_dir": artifact, "reason": "promote"},
-            "promote": True,
-            "from_fail_queue": False,
-            "reuse_ok": True,
-            "dir": directory,
-        })
-        log(f"promote {code} n={int(action['step_count'])}")
-        append_log(run, f"promote {code} n={int(action['step_count'])}")
+        if _retire_slot_busy(run, slot, action, close=close):
+            doomed.append(slot)
     for slot in doomed:
         if slot in slots:
             slots.remove(slot)
@@ -1759,6 +1803,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 challenges,
                 room=max(0, fgs_max_active() - fgs_live_now),
                 skip_codes=seen_codes,
+                close=attempt_close,
             )
         start_plans(promote_plans)
 
