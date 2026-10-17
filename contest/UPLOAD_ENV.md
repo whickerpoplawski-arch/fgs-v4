@@ -145,7 +145,7 @@ A1–A3 锁的是 `CONTEST_FGS_MODE=after_sec` 的墙钟。`on_fail` 忽略墙�
 
 ## Baseline 轻约束
 
-这是 **harness / Cordis 钩子**，不是新的模型 tool，也不装 `dsh-routing-suite` / graded / super-injector。`prompt.txt` 里的「输出纪律」（PR#14）仍是软契约；本层用 `agent/pre-step` 在 `next()` 之后 `enter` 一批 sourced user message（`source.kind=plugin`），保证写进**本步 admitted request**。不改 `thinking: disabled`，不改 Fail-then-FGS 队列。
+这是 **harness / Cordis 钩子**，不是新的模型 tool，也不装 `dsh-routing-suite` / graded / super-injector。`prompt.txt` 里的「输出纪律」（PR#14）仍是软契约；本层用 `agent/pre-step` 在 `next()` 之后 `enter` 一批 sourced user message（`source.kind=plugin:contest-benchmark-tools`，format v4 producer-owned），保证写进**本步 admitted request**。不改 `thinking: disabled`，不改 Fail-then-FGS 队列。
 
 挂在已有的 `@local/contest-benchmark-tools`（baseline 与 contest 都会加载）。`inject` 仍只有 `['tools']`：`ctx.on('agent/pre-step')` 不需要 `agents` 服务，避免和 FGS profile 抢依赖。关总开关即可做 A/B。
 

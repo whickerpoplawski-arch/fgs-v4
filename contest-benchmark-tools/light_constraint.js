@@ -14,6 +14,8 @@ import { randomUUID } from 'node:crypto';
 import { recordObservation } from './api.js';
 
 export const PLUGIN_ID = 'contest-benchmark-tools';
+/** Format v4 producer-owned kind. Literal `plugin` is rejected at admission. */
+export const PLUGIN_SOURCE_KIND = `plugin:${PLUGIN_ID}`;
 export const STATE_FILE = '.fgs/light_constraint_state.json';
 
 export const L1_CONTRACT =
@@ -204,8 +206,7 @@ export function buildInjectText({
 export function createPluginUserMessage(text, { summary } = {}) {
   const body = String(text || '');
   const source = {
-    kind: 'plugin',
-    plugin: PLUGIN_ID,
+    kind: PLUGIN_SOURCE_KIND,
     form: 'notice',
     summary: String(summary || '轻约束').slice(0, 120),
   };
@@ -291,10 +292,12 @@ export function saveState(cwd, state) {
 }
 
 function alreadyInjected(messages) {
-  return (messages || []).some((message) => (
-    message?.source?.plugin === PLUGIN_ID
-    || message?.source?.kind === 'plugin' && extractText(message.content).includes('【轻约束】')
-  ));
+  return (messages || []).some((message) => {
+    const kind = message?.source?.kind;
+    return kind === PLUGIN_SOURCE_KIND
+      || message?.source?.plugin === PLUGIN_ID
+      || (kind === 'plugin' && extractText(message.content).includes('【轻约束】'));
+  });
 }
 
 function claimedLooksLikeTitle(messages) {

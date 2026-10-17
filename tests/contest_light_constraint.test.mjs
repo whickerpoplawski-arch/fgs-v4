@@ -13,6 +13,7 @@ import {
   L2_BREAK,
   L3_ANCHORS,
   PLUGIN_ID,
+  PLUGIN_SOURCE_KIND,
   applyLightConstraint,
   buildInjectText,
   createPluginUserMessage,
@@ -22,6 +23,16 @@ import {
   shouldBreak,
   similarFingerprints,
 } from '../contest-benchmark-tools/light_constraint.js';
+
+/** Mirrors dsh session-format-v3-to-v4 `source()`: reject empty / non-string / literal `plugin`. */
+function assertV4ProducerOwnedSource(source) {
+  assert.equal(typeof source, 'object');
+  assert.ok(source && !Array.isArray(source));
+  assert.equal(typeof source.kind, 'string');
+  assert.ok(source.kind.length > 0);
+  assert.notEqual(source.kind, 'plugin');
+  assert.equal(source.plugin, undefined);
+}
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -204,8 +215,9 @@ test('pre-step injects a plugin-sourced 轻约束 message into the enter batch',
   assert.equal(decision.messages.length, 2);
   const injected = decision.messages[1];
   assert.equal(injected.role, 'user');
-  assert.equal(injected.source.kind, 'plugin');
-  assert.equal(injected.source.plugin, PLUGIN_ID);
+  assertV4ProducerOwnedSource(injected.source);
+  assert.equal(injected.source.kind, PLUGIN_SOURCE_KIND);
+  assert.equal(injected.source.kind, `plugin:${PLUGIN_ID}`);
   const text = injected.content.map((block) => block.text).join('');
   assert.match(text, /【轻约束】/);
   assert.match(text, /≤2/);
@@ -274,10 +286,11 @@ test('repeated bash fingerprints arm 环打断 on the next pre-step', async () =
   assert.match(text, /【环打断】/);
 });
 
-test('createPluginUserMessage is sourced as plugin and apply still registers the three tools', async () => {
+test('createPluginUserMessage is sourced as plugin:<id> and apply still registers the three tools', async () => {
   const message = createPluginUserMessage(L1_CONTRACT);
-  assert.equal(message.source.kind, 'plugin');
-  assert.equal(message.source.plugin, PLUGIN_ID);
+  assertV4ProducerOwnedSource(message.source);
+  assert.equal(message.source.kind, PLUGIN_SOURCE_KIND);
+  assert.equal(message.source.kind, `plugin:${PLUGIN_ID}`);
   assert.match(message.content[0].text, /轻约束/);
 
   const registered = [];
