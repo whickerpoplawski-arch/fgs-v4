@@ -92,7 +92,7 @@ Installing this plugin into a profile bundle only provides the **FGS tools and t
 TSecBench 托管容器在插件之外还要：
 
 - **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` →（仅 FGS profile）磁盘预种 → Solver 任务书 → `dsh --profile <contest-baseline|contest>`。baseline 不预种。FGS 预种在任何模型回合之前完成。
-- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`、`CONTEST_FGS_MODE=on_fail`。新题用 `contest-baseline`。只有失败题的二遍用 `contest`。不热挂载，不为切换杀正在跑的 worker。`CONTEST_FGS_AFTER_SEC` 只在 `mode=after_sec` 时生效。
+- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`、`CONTEST_FGS_MODE=on_fail`。新题用 `contest-baseline`。失败题末轮用 `contest`。不热挂载。一遍 pre-step 超过 `CONTEST_CHALLENGE_FGS_AFTER_STEPS`（上传 `50`）且 FGS 槽有余量时，杀掉该 baseline，在同一目录以 `contest` 重开；槽满不杀。末轮不因步数被杀。`CONTEST_FGS_AFTER_SEC` 只在 `mode=after_sec` 时生效。
 - **不要设置** `BENCHMARK_*`，也不要在上传页写全局 `FGS_UNIQUE_CODE`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入。
 - **交 flag**：baseline 走 `benchmark_submit_flag`（同一 POST submit）。FGS 插件仍保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`。
 - 竞赛 profile 用 **stock Messages**：`provider: deepseek-official`，`baseURL: https://api.deepseek.com/anthropic`。`SOLVER_GATEWAY=1` 只改写模型基址（`https://api.deepseek.com/anthropic` → `http://api.deepseek.com.tsecbench.gw/anthropic`），不改 `BENCHMARK_*` 和 Challenges API。不要把 `deepseek-official` 配成 `openai-completions`。
@@ -293,7 +293,8 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_DSH_PROFILE` | `contest-baseline` | 新题一遍的 `--profile`。bundles 不含 FGS |
 | `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 `--profile`。含 FGS + `benchmark_*` |
 | `CONTEST_FGS_MODE` | `on_fail` | 新题保持 baseline。失败（进程已死、deferred 过宽限、一遍步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或可选墙钟预算）才 FIFO 二遍。`after_sec` 是旧墙钟且不重试。`off` 永不 FGS |
-| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 一遍 pre-step 上限。`0` 关。`> N` 才入失败队。上传推荐 `100`。FGS 二遍不吃这个上限，也不吃 `CONTEST_FAIL_ON_BUDGET` |
+| `CONTEST_CHALLENGE_MAX_STEPS` | `0` | pre-step 上限。`0` 关。`> N` 才入失败队。上传推荐 `100`。baseline 和 mid-FGS 都吃。末轮 `from_fail_queue` 不吃，也不吃 `CONTEST_FAIL_ON_BUDGET` |
+| `CONTEST_CHALLENGE_FGS_AFTER_STEPS` | `0` | 一遍 `> M` 且 FGS 槽有余量则杀再建挂 `contest`。上传推荐 `50`。`0`、`MAX_STEPS<=0` 或 `AFTER>=MAX` 时关。槽满不杀。与 `CONTEST_FGS_AFTER_SEC` 无关 |
 | `CONTEST_FGS_AFTER_SEC` | `7200` | **仅 `mode=after_sec`。** `on_fail` 忽略。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
 | `CONTEST_FGS_RETRY_LAST` | `1` | 有新题时不跑 FGS |
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
