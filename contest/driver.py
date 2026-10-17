@@ -11,8 +11,12 @@ The default mode (``CONTEST_FGS_MODE=on_fail``) keeps every new challenge on
 that baseline. A challenge gets profile ``contest`` only on a later FGS pass,
 after the narrow fail rule puts it on the FIFO retry queue. ``after_sec`` keeps
 the old wall-clock switch (``CONTEST_FGS_AFTER_SEC``) and does not retry.
-The choice is per new worker. A running worker is not hot-swapped and is not
-killed to change profiles.
+The choice is per new worker. A running worker is not hot-swapped. It is
+killed to change profiles only when a baseline's pre-step count exceeds
+``CONTEST_CHALLENGE_FGS_AFTER_STEPS`` and an FGS slot is free (promote). That
+relaunch stays on the same workdir, does not enter ``failed/``, and does not
+close the container. The step cap still retires a baseline and that mid-round
+FGS; only a fail-queue last round is exempt.
 
 `dsh` is not vendored here. Unless CONTEST_DSH_LAUNCH=1 and `dsh` is on PATH,
 the launch step records a stub under `.fgs/dsh-launch.json`.
@@ -38,7 +42,9 @@ Offline fixture (no platform): CONTEST_FIXTURE=/path/to.json
 
 CONTEST_SUPERVISOR defaults on. The loop lives in this process: reap containers
 whose worker died, retire deferred/solved workers after grace, optionally
-retire a first pass that exceeded CONTEST_CHALLENGE_MAX_STEPS, and start the
+retire a worker that exceeded CONTEST_CHALLENGE_MAX_STEPS (not a fail-queue
+last round), optionally promote a baseline past CONTEST_CHALLENGE_FGS_AFTER_STEPS,
+and start the
 next visit only when both alive workers and active containers are under
 CONTEST_MAX_ACTIVE. It does not exec contest/supervisor/autosup.sh (that is a
 second scheduler for the worker-directory layout).
@@ -81,7 +87,9 @@ from fail_queue import (
     note_fgs_dispatch,
     park_unclassified,
     plan_budget_retire,
+    plan_promote,
     plan_steps_retire,
+    promote_after_steps,
     queue_fgs,
     queue_new,
     read_step_count,
@@ -915,6 +923,7 @@ def visit(
     enrich_dir: str | None = None,
     fail_reason: str = "",
     reuse_ok: bool = True,
+    from_fail_queue: bool = False,
 ) -> dict:
     raw_code = str(challenge.get("unique_code") or challenge.get("code") or "").strip()
     problem_id = normalize_problem_id(raw_code)
@@ -1004,6 +1013,7 @@ def visit(
             "started": started,
             "reused": reused,
             "budget_min": fields.get("budget_min") or "",
+            "from_fail_queue": bool(from_fail_queue) and kind == "fgs",
         }
         if proc is not None:
             result["pid"] = proc.pid
@@ -1138,6 +1148,7 @@ def remember_slot(result: dict) -> dict | None:
         "launched": bool(result.get("launched")),
         "session_id": "",
         "pass_kind": result.get("pass") or "first",
+        "from_fail_queue": bool(result.get("from_fail_queue")),
         "profile": result.get("profile") or "",
         "started_at": stamp_utc(),
         "budget_min": result.get("budget_min") or "",
@@ -1278,17 +1289,21 @@ def _settle_fgs_end(run: Path, code: str) -> None:
 
 
 def _classify_dead_slot(run: Path, slot: dict, challenges, *, transport_glitch: bool) -> None:
-    """Record a finished worker. A list glitch parks it instead of enqueueing."""
+    """Record a finished worker. A list glitch parks it instead of enqueueing.
+
+    Only a fail-queue last round (``from_fail_queue``) settles in place.
+    A mid-round promoted FGS is enqueued like a baseline reap.
+    """
     code = str(slot.get("code") or "").strip()
     if not code:
         return
     view = slot_view(slot)
     if view["alive"]:
         return
-    pass_kind = slot.get("pass_kind") or "first"
-    if pass_kind == "fgs":
+    if slot.get("from_fail_queue"):
         _settle_fgs_end(run, code)
         return
+    pass_kind = slot.get("pass_kind") or "first"
     if not view["launched"]:
         _mark_done(run, code)
         return
@@ -1298,6 +1313,7 @@ def _classify_dead_slot(run: Path, slot: dict, challenges, *, transport_glitch: 
                 "unique_code": code,
                 "dir": slot.get("dir") or "",
                 "pass_kind": pass_kind,
+                "from_fail_queue": False,
                 "reason": "reap",
             })
         except SupervisorError as exc:
@@ -1336,10 +1352,12 @@ def _drain_unclassified(run: Path, challenges) -> None:
         except SupervisorError as exc:
             log(f"discard parked {code} failed: {exc}")
             continue
-        if is_completed(matched) or info.get("pass_kind") == "fgs":
+        if is_completed(matched):
             _mark_done(run, code)
-            if info.get("pass_kind") == "fgs":
-                _settle_fgs_end(run, code)
+            continue
+        if info.get("from_fail_queue"):
+            _mark_done(run, code)
+            _settle_fgs_end(run, code)
             continue
         _enqueue_fail(run, code, str(info.get("reason") or "reap"), info.get("dir") or "")
 
@@ -1349,12 +1367,13 @@ def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *,
     if not code:
         return
     state = str(action.get("state") or "")
-    pass_kind = (slot or {}).get("pass_kind") or "first"
-    directory = action.get("dir") or (slot or {}).get("dir") or ""
+    held = slot or {}
+    pass_kind = held.get("pass_kind") or "first"
+    directory = action.get("dir") or held.get("dir") or ""
     if state == "solved" or _code_completed(challenges, code):
         _mark_done(run, code)
         return
-    if pass_kind == "fgs":
+    if held.get("from_fail_queue"):
         _settle_fgs_end(run, code)
         return
     if state not in ("deferred", "budget", "steps"):
@@ -1366,6 +1385,7 @@ def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *,
                 "unique_code": code,
                 "dir": directory,
                 "pass_kind": pass_kind,
+                "from_fail_queue": False,
                 "reason": state,
             })
         except SupervisorError as exc:
@@ -1377,6 +1397,127 @@ def _note_retire_fail(run: Path, action: dict, slot: dict | None, challenges, *,
     except (TypeError, ValueError):
         step_count = None
     _enqueue_fail(run, code, state, directory, step_count=step_count)
+
+
+def _cap_view(slot: dict) -> dict:
+    view = slot_view(slot)
+    view["started_at"] = slot.get("started_at")
+    view["budget_min"] = slot.get("budget_min")
+    view["pass_kind"] = slot.get("pass_kind") or "first"
+    view["from_fail_queue"] = bool(slot.get("from_fail_queue"))
+    view["step_count"] = read_step_count(slot.get("dir"))
+    return view
+
+
+def _challenge_for(challenges, code: str) -> dict | None:
+    for item in challenges or []:
+        if not isinstance(item, dict):
+            continue
+        found = str(item.get("unique_code") or item.get("code") or "").strip()
+        if found == code:
+            return item
+    return None
+
+
+def _clear_step_count(directory: str | None) -> None:
+    """Drop the sidecar so the next process on this same cwd counts from 0."""
+    if not directory:
+        return
+    path = Path(directory) / ".fgs" / "dsh_step_count"
+    try:
+        path.unlink()
+    except OSError:
+        return
+
+
+def promote_enrich_dir(run: Path, code: str) -> Path:
+    """Enrich copy for a promote. Never the fail-queue artifact directory."""
+    return Path(run) / "queue" / "promote_enrich" / safe_code(code)
+
+
+def _copy_fresh_snapshot(src: str | None, dest: Path) -> str:
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    try:
+        return snapshot_artifacts(Path(src) if src else None, dest)
+    except (SupervisorError, OSError) as exc:
+        log(f"snapshot {dest.name} failed: {exc}")
+        return ""
+
+
+def _drop_tree(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+
+
+def apply_promotes(run: Path, slots: list[dict], challenges, *, room: int, skip_codes: set[str]) -> list[dict]:
+    """Snapshot, kill, and schedule a same-cwd FGS relaunch for baselines past the promote line.
+
+    Returns visit plans. Does not write ``failed/``, does not close the
+    container, and does not consume an FGS retry. ``room`` is how many FGS
+    slots are free; a full slot leaves the baseline running. A process that
+    is still alive after ``terminate_pid`` is not relaunched.
+    """
+    if room <= 0:
+        return []
+    after = promote_after_steps()
+    limit = challenge_max_steps()
+    if after <= 0:
+        return []
+    actions = plan_promote(
+        [_cap_view(slot) for slot in slots],
+        challenges,
+        after=after,
+        limit=limit,
+        skip_codes=skip_codes,
+    )
+    plans = []
+    doomed: list[dict] = []
+    for action in actions:
+        if len(plans) >= room:
+            break
+        code = str(action.get("code") or "")
+        slot = next((item for item in slots if item.get("code") == code), None)
+        if slot is None or not slot_view(slot)["alive"]:
+            continue
+        challenge = _challenge_for(challenges, code)
+        if challenge is None:
+            continue
+        directory = str(action.get("dir") or slot.get("dir") or "")
+        dest = promote_enrich_dir(run, code)
+        artifact = _copy_fresh_snapshot(directory, dest)
+        terminate_pid(action.get("pid"))
+        if slot_view(slot)["alive"]:
+            _drop_tree(dest)
+            log(f"promote {code} skipped (still alive)")
+            continue
+        _clear_step_count(directory)
+        doomed.append(slot)
+        plans.append({
+            "challenge": challenge,
+            "pass_kind": "fgs",
+            "code": code,
+            "record": {"artifact_dir": artifact, "reason": "promote"},
+            "promote": True,
+            "from_fail_queue": False,
+            "reuse_ok": True,
+            "dir": directory,
+        })
+        log(f"promote {code} n={int(action['step_count'])}")
+        append_log(run, f"promote {code} n={int(action['step_count'])}")
+    for slot in doomed:
+        if slot in slots:
+            slots.remove(slot)
+    return plans
+
+
+def note_promote_launch_failure(run: Path, plan: dict, result: dict) -> None:
+    """A promote that died before the new worker existed still has to enter the FIFO."""
+    code = str((plan or {}).get("code") or (result or {}).get("code") or "").strip()
+    if not code or not (plan or {}).get("promote") or (result or {}).get("ok"):
+        return
+    directory = str((plan or {}).get("dir") or (result or {}).get("cwd") or "")
+    _enqueue_fail(run, code, "promote", directory)
 
 
 def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_path: str) -> int:
@@ -1458,16 +1599,10 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
 
         views = [slot_view(slot) for slot in slots]
         retire_actions = plan_retire(views, challenges, now=utc_now(), grace=grace, grace_solved=grace_solved)
+        seen_codes: set[str] = set()
         if use_fail_queue:
             seen_codes = {action["code"] for action in retire_actions}
-            capped = []
-            for slot in slots:
-                view = slot_view(slot)
-                view["started_at"] = slot.get("started_at")
-                view["budget_min"] = slot.get("budget_min")
-                view["pass_kind"] = slot.get("pass_kind") or "first"
-                view["step_count"] = read_step_count(slot.get("dir"))
-                capped.append(view)
+            capped = [_cap_view(slot) for slot in slots]
             for action in plan_steps_retire(
                 capped,
                 challenges,
@@ -1494,6 +1629,13 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 )
                 log(f"hold {action['code']} ({action['state']})")
                 continue
+            if use_fail_queue and str(action.get("state") or "") == "steps":
+                directory = action.get("dir") or ""
+                try:
+                    dest = run / "queue" / "artifacts" / safe_code(str(action.get("code") or ""))
+                    snapshot_artifacts(Path(directory) if directory else None, dest)
+                except (SupervisorError, OSError) as exc:
+                    log(f"snapshot {action.get('code')} failed: {exc}")
             terminate_pid(action.get("pid"))
             attempt_close(action["code"])
             if action.get("archive") and action.get("dir"):
@@ -1513,6 +1655,79 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
         for sampler in plan_gc_samplers(alive_ids, list_samplers()):
             terminate_pid(sampler.get("pid"), wait=0.2)
             append_log(run, f"gc sampler pid={sampler.get('pid')} (session={sampler.get('session_id')})")
+
+        def start_plans(batch: list[dict]) -> None:
+            if not batch:
+                return
+            for plan in batch:
+                code = plan.get("code") or ""
+                if not code or plan.get("promote"):
+                    continue
+                if use_fail_queue and plan["pass_kind"] == "fgs":
+                    try:
+                        note_fgs_dispatch(run, code, fgs_max_retries())
+                    except SupervisorError as exc:
+                        log(f"note fgs dispatch {code} failed: {exc}")
+                elif use_fail_queue:
+                    try:
+                        mark_first_pass_started(run, code)
+                    except SupervisorError as exc:
+                        log(f"mark first pass started {code} failed: {exc}")
+                else:
+                    attempted.add(code)
+            with ThreadPoolExecutor(max_workers=max(1, min(len(batch), cap))) as pool:
+                pending = {}
+                for plan in batch:
+                    record = plan.get("record") or {}
+                    code = plan.get("code") or ""
+                    reuse_ok = plan["reuse_ok"] if "reuse_ok" in plan else code not in closed_this_tick
+                    future = pool.submit(
+                        visit,
+                        plan["challenge"],
+                        base=base,
+                        prefix=prefix,
+                        token=token,
+                        workdir=workdir,
+                        fixture=bool(fixture_path),
+                        background=True,
+                        pass_kind=plan["pass_kind"],
+                        enrich_dir=record.get("artifact_dir") or None,
+                        fail_reason=str(record.get("reason") or ""),
+                        reuse_ok=reuse_ok,
+                        from_fail_queue=bool(plan.get("from_fail_queue")),
+                    )
+                    pending[future] = plan
+                for future in as_completed(pending):
+                    plan = pending[future]
+                    result = future.result()
+                    visits.append(result)
+                    if not result.get("ok"):
+                        if result.get("code"):
+                            blocked.add(result["code"])
+                        note_promote_launch_failure(run, plan, result)
+                        if result.get("close") and result.get("code"):
+                            attempt_close(result["code"])
+                        continue
+                    remembered = remember_slot(result)
+                    if remembered is not None:
+                        slots.append(remembered)
+            # Let a just-started worker write meta.json before the next retire read.
+            if any(slot.get("proc") is not None for slot in slots):
+                time.sleep(0.2)
+
+        promote_plans: list[dict] = []
+        if use_fail_queue and not list_failed:
+            fgs_live_now = sum(
+                1 for slot in slots if slot.get("pass_kind") == "fgs" and slot_view(slot)["alive"]
+            )
+            promote_plans = apply_promotes(
+                run,
+                slots,
+                challenges,
+                room=max(0, fgs_max_active() - fgs_live_now),
+                skip_codes=seen_codes,
+            )
+        start_plans(promote_plans)
 
         inflight = {slot.get("code") for slot in slots if slot.get("code")}
         alive = sum(1 for slot in slots if slot_view(slot)["alive"])
@@ -1574,55 +1789,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
         log(f"supervisor tick alive={alive} active={active} queue={queue_len} budget={budget}{tick_extra}")
 
         if plans:
-            for plan in plans:
-                code = plan.get("code") or ""
-                if not code:
-                    continue
-                if use_fail_queue and plan["pass_kind"] == "fgs":
-                    try:
-                        note_fgs_dispatch(run, code, retries)
-                    except SupervisorError as exc:
-                        log(f"note fgs dispatch {code} failed: {exc}")
-                elif use_fail_queue:
-                    try:
-                        mark_first_pass_started(run, code)
-                    except SupervisorError as exc:
-                        log(f"mark first pass started {code} failed: {exc}")
-                else:
-                    attempted.add(code)
-            with ThreadPoolExecutor(max_workers=max(1, min(len(plans), cap))) as pool:
-                futures = []
-                for plan in plans:
-                    record = plan.get("record") or {}
-                    futures.append(pool.submit(
-                        visit,
-                        plan["challenge"],
-                        base=base,
-                        prefix=prefix,
-                        token=token,
-                        workdir=workdir,
-                        fixture=bool(fixture_path),
-                        background=True,
-                        pass_kind=plan["pass_kind"],
-                        enrich_dir=record.get("artifact_dir") or None,
-                        fail_reason=str(record.get("reason") or ""),
-                        reuse_ok=plan.get("code") not in closed_this_tick,
-                    ))
-                for future in as_completed(futures):
-                    result = future.result()
-                    visits.append(result)
-                    if not result.get("ok"):
-                        if result.get("code"):
-                            blocked.add(result["code"])
-                        if result.get("close") and result.get("code"):
-                            attempt_close(result["code"])
-                        continue
-                    remembered = remember_slot(result)
-                    if remembered is not None:
-                        slots.append(remembered)
-            # Let a just-started worker write meta.json before the next retire read.
-            if any(slot.get("proc") is not None for slot in slots):
-                time.sleep(0.2)
+            start_plans(plans)
             continue
 
         # A failed list is not an empty queue. A close that never got an answer

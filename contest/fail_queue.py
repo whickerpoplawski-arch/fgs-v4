@@ -93,12 +93,34 @@ def fail_on_budget() -> bool:
 
 
 def challenge_max_steps() -> int:
-    """First-pass pre-step cap. ``0`` disables. Upload recommendation is 100.
+    """Pre-step fail cap. ``0`` disables. Upload recommendation is 100.
 
-    Compared with ``> N`` (a worker at exactly ``N`` keeps running). FGS
-    passes ignore this cap. Orthogonal to ``CONTEST_FAIL_ON_BUDGET``.
+    Compared with ``> N`` (a worker at exactly ``N`` keeps running). A
+    fail-queue last round (``from_fail_queue``) ignores this cap. A baseline
+    and a mid-round promoted FGS both take it. Orthogonal to
+    ``CONTEST_FAIL_ON_BUDGET``.
     """
     return env_int_default("CONTEST_CHALLENGE_MAX_STEPS", 0, minimum=0)
+
+
+def challenge_fgs_after_steps() -> int:
+    """Baseline pre-step count that promotes onto the FGS profile.
+
+    ``0`` disables. Upload recommendation is 50. Compared with ``> M``.
+    Promote stays off when this value is ``0``, when
+    ``CONTEST_CHALLENGE_MAX_STEPS`` is ``0``, or when this value is greater
+    than or equal to the step cap (the fail path would always win first).
+    """
+    return env_int_default("CONTEST_CHALLENGE_FGS_AFTER_STEPS", 0, minimum=0)
+
+
+def promote_after_steps() -> int:
+    """Return the promote threshold, or ``0`` when promote is disabled."""
+    after = challenge_fgs_after_steps()
+    limit = challenge_max_steps()
+    if after <= 0 or limit <= 0 or after >= limit:
+        return 0
+    return after
 
 
 def read_step_count(directory: str | Path | None) -> int | None:
@@ -456,6 +478,7 @@ def select_dispatch(
                     "pass_kind": "first",
                     "code": challenge_code(item),
                     "record": None,
+                    "from_fail_queue": False,
                 })
             return chosen
         for item in fgs_q[: min(budget, take_fgs)]:
@@ -464,6 +487,7 @@ def select_dispatch(
                 "pass_kind": "fgs",
                 "code": item["code"],
                 "record": item["record"],
+                "from_fail_queue": True,
             })
         return chosen
     fgs_take = min(take_fgs, budget)
@@ -474,6 +498,7 @@ def select_dispatch(
             "pass_kind": "first",
             "code": challenge_code(item),
             "record": None,
+            "from_fail_queue": False,
         })
     for item in fgs_q[:fgs_take]:
         chosen.append({
@@ -481,6 +506,7 @@ def select_dispatch(
             "pass_kind": "fgs",
             "code": item["code"],
             "record": item["record"],
+            "from_fail_queue": True,
         })
     return chosen
 
@@ -496,9 +522,11 @@ def _completed_codes(challenges) -> set[str]:
 
 
 def _first_pass_live(worker, completed: set[str]) -> str:
-    """Return the code when this live worker may take a first-pass cap.
+    """Return the code when this live worker may take a step or budget cap.
 
-    FGS passes, deferred, solved, and platform-completed codes return ``""``.
+    Fail-queue last rounds (``from_fail_queue``), deferred, solved, and
+    platform-completed codes return ``""``. A mid-round promoted FGS does not:
+    ``pass_kind=fgs`` alone is not an exemption.
     """
     if not worker.get("alive"):
         return ""
@@ -508,16 +536,17 @@ def _first_pass_live(worker, completed: set[str]) -> str:
     state = str(worker.get("meta_state") or "").strip().lower()
     if state in ("deferred", "solved"):
         return ""
-    if str(worker.get("pass_kind") or "first").strip().lower() == "fgs":
+    if worker.get("from_fail_queue"):
         return ""
     return code
 
 
 def plan_steps_retire(workers, challenges, *, limit: int) -> list[dict]:
-    """Retire a live first pass whose step sidecar is past ``limit``.
+    """Retire a live worker whose step sidecar is past ``limit``.
 
     ``limit <= 0`` disables the check. Comparison is strict ``> limit``.
-    A missing step count is fail-open. FGS passes are never step-retired.
+    A missing step count is fail-open. Workers marked ``from_fail_queue``
+    are never step-retired. A promoted mid-round FGS still is.
     """
     if limit <= 0:
         return []
@@ -548,12 +577,48 @@ def plan_steps_retire(workers, challenges, *, limit: int) -> list[dict]:
     return actions
 
 
+def plan_promote(workers, challenges, *, after: int, limit: int, skip_codes: set[str] | None = None) -> list[dict]:
+    """Promote a live baseline whose steps are past ``after`` and not past ``limit``.
+
+    ``after <= 0``, ``limit <= 0``, or ``after >= limit`` disables promote.
+    Comparison is strict ``> after``. A worker already past ``limit`` is a
+    step fail, not a promote. Already-FGS workers and ``skip_codes`` (retired
+    this tick, including a same-tick step fail) are left alone.
+    """
+    if after <= 0 or limit <= 0 or after >= limit:
+        return []
+    completed = _completed_codes(challenges)
+    skipped = {str(code).strip() for code in (skip_codes or set()) if str(code).strip()}
+    actions = []
+    for worker in workers or []:
+        code = _first_pass_live(worker, completed)
+        if not code or code in skipped:
+            continue
+        if str(worker.get("pass_kind") or "first").strip().lower() == "fgs":
+            continue
+        try:
+            steps = int(worker.get("step_count"))
+        except (TypeError, ValueError):
+            continue
+        if steps <= after or steps > limit:
+            continue
+        actions.append({
+            "op": "promote",
+            "code": code,
+            "pid": worker.get("pid"),
+            "dir": worker.get("dir"),
+            "step_count": steps,
+        })
+    actions.sort(key=lambda item: (-int(item["step_count"]), str(item["code"])))
+    return actions
+
+
 def plan_budget_retire(workers, challenges, *, now: datetime, enabled: bool) -> list[dict]:
-    """Force-retire a live first pass that outlived its budget. Default caller is off.
+    """Force-retire a live worker that outlived its budget. Default caller is off.
 
     Deferred and solved workers stay on ``plan_retire``. A challenge the
-    platform already completed is not a budget fail. An FGS pass is not a
-    budget fail either: the last-round retry has no wall-clock cap.
+    platform already completed is not a budget fail. A fail-queue last round
+    (``from_fail_queue``) is not a budget fail. A promoted mid-round FGS is.
     """
     if not enabled:
         return []
