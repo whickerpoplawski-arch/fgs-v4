@@ -68,9 +68,17 @@ test('drop_step 缺 reason 拒收；空白 reason 同样拒收', () => {
   const { ctl } = seededWithOpenStep();
   assert.throws(() => ctl.apply(dropStepOp({ stepId: 'step_001', reason: '' })), /reason/);
   assert.throws(() => ctl.apply(dropStepOp({ stepId: 'step_001', reason: '   ' })), /reason/);
-  const graph = ctl.apply(dropStepOp({ stepId: 'step_001', reason: '目标不可达' }));
+  assert.throws(
+    () => ctl.apply(dropStepOp({ stepId: 'step_001', reason: '目标不可达' })),
+    /fact_origin|fact_NNN/,
+  );
+  assert.throws(
+    () => ctl.apply(dropStepOp({ stepId: 'step_001', reason: 'artifact_001 看起来像 fact' })),
+    /fact_origin|fact_NNN/,
+  );
+  const graph = ctl.apply(dropStepOp({ stepId: 'step_001', reason: '目标不可达，见 fact_origin' }));
   assert.equal(graph.steps[0].state, 'dropped');
-  assert.equal(graph.steps[0].reason, '目标不可达');
+  assert.equal(graph.steps[0].reason, '目标不可达，见 fact_origin');
 });
 
 test('change_step_priority 只作用于 open step', () => {
