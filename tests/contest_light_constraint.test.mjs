@@ -145,7 +145,7 @@ test('L1 is a one-line operational ≤2 then tool_call contract without language
   assert.equal(L1_CONTRACT.includes('\n'), false);
   assert.match(L1_CONTRACT, /≤2/);
   assert.match(L1_CONTRACT, /tool_call/);
-  assert.match(L1_CONTRACT, /无文字/);
+  assert.match(L1_CONTRACT, /skip visible text/);
   assert.match(L1_CONTRACT, /本题结束|收尾/);
   assert.doesNotMatch(L1_CONTRACT, /默认中文/);
   assert.doesNotMatch(L1_CONTRACT, /I'll start/);

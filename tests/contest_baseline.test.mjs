@@ -189,9 +189,9 @@ test('Solver brief matches the rival e3-02 text', () => {
   const expected = golden.endsWith('\n') ? golden : `${golden}\n`;
   assert.equal(result.stdout, expected);
   assert.match(result.stdout, /## 输出纪律/);
-  assert.match(result.stdout, /≤2 句/);
-  assert.match(result.stdout, /第 2 句后立刻 tool_call/);
-  assert.match(result.stdout, /无文字直接工具/);
+  assert.match(result.stdout, /≤2 visible sentences/);
+  assert.match(result.stdout, /after the 2nd sentence immediately tool_call/);
+  assert.match(result.stdout, /skip visible text and call the tool/);
   assert.match(result.stdout, /禁止复述同一结论/);
   assert.match(result.stdout, /最多一句「本题结束」/);
   assert.doesNotMatch(result.stdout, /已达成原语|利用配方|凭证与产物|<Handoff>|收尾契约/);

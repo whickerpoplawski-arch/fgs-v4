@@ -11,7 +11,7 @@
 
 ## 输出纪律
 
-- 工具调用前可见文字 ≤2 句：一句当前假设，一句下一步；第 2 句后立刻 tool_call，或无文字直接工具。
+- ≤2 visible sentences before a tool call: one current hypothesis, one next step; after the 2nd sentence immediately tool_call, or skip visible text and call the tool.
 - 禁止复述同一结论；禁止 PHP/源码讲义、writeup、复盘、运营口诀。
 - 平台已确认通关：提交 flag 后最多一句「本题结束」，停止。
 - 未通关结束：只用下方收尾，不要散文。
