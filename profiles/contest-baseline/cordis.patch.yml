@@ -6,7 +6,7 @@
 # Messages root is https://api.deepseek.com/anthropic (the client appends /v1/messages).
 # SOLVER_GATEWAY=1 rewrites this baseURL host only. BENCHMARK_* is not a model URL.
 # apiKeyEnv resolves at runtime from the upload page. Do not bake the key.
-# thinking is off so solve turns are not spent on reasoning traces.
+# thinking is enabled. dsh 0.2.1-rc.2 TRANSPORT-fails when thinking is disabled.
 - id: agent-default-model
   config:
     provider: deepseek-official
@@ -16,7 +16,7 @@
   config:
     apiKeyEnv: DEEPSEEK_API_KEY
     baseURL: https://api.deepseek.com/anthropic
-    thinking: disabled
+    thinking: enabled
     reasoningEffort: off
 
 # Hosted has no approval channel. danger-full-access runs bash without bwrap
@@ -29,3 +29,32 @@
 - id: approval
   config:
     policy: never
+
+# dsh-ops: force all 4 components running (shell/file/background/ptc)
+- id: dsh-ops-shell
+  disabled: false
+  config:
+    promptPolicy: true
+    publishBashTool: true
+    shellPolicy: advise
+    allowSystemShellFallback: false
+- id: dsh-ops-file
+  disabled: false
+  config:
+    promptPolicy: true
+    enableShellTools: false
+    required: false
+    toolCallTimeoutMs: 300000
+- id: dsh-ops-background
+  disabled: false
+  config:
+    promptPolicy: true
+    enableShellTools: true
+    required: false
+    toolCallTimeoutMs: 300000
+    bashPath: /bin/bash
+    binaryPath: /opt/dsh-ops/bin/fastctx
+- id: dsh-ops-ptc
+  disabled: false
+  config:
+    required: false

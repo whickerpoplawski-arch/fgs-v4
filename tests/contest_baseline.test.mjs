@@ -206,22 +206,36 @@ test('A9 profile bundles: baseline has no FGS, contest has FGS and benchmark too
   assert.deepEqual(baseline.dsh.profile.bundles, [
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-headless',
+    'dsh-ops',
     '@local/contest-benchmark-tools',
   ]);
+  assert.deepEqual(contest.dsh.profile.bundles, [
+    '@deepseek-ai/dsh-base',
+    '@deepseek-ai/dsh-headless',
+    'dsh-ops',
+    '@local/contest-benchmark-tools',
+    '@local/fgs-deepseek-dsh',
+  ]);
   assert.equal(baseline.dependencies['@local/fgs-deepseek-dsh'], undefined);
-  assert.ok(contest.dsh.profile.bundles.includes('@local/fgs-deepseek-dsh'));
-  assert.ok(contest.dsh.profile.bundles.includes('@local/contest-benchmark-tools'));
+  assert.equal(baseline.dependencies['dsh-ops'], 'file:/opt/dsh-ops');
+  assert.equal(contest.dependencies['dsh-ops'], 'file:/opt/dsh-ops');
+  assert.equal(contest.dependencies['@local/fgs-deepseek-dsh'], 'file:/opt/fgs-v4');
   for (const name of ['contest-baseline', 'contest']) {
     const patch = fs.readFileSync(path.join(repoRoot, 'profiles', name, 'cordis.patch.yml'), 'utf8');
     assert.match(patch, /provider: deepseek-official/);
     assert.match(patch, /baseURL: https:\/\/api\.deepseek\.com\/anthropic/);
-    assert.match(patch, /thinking: disabled/);
+    assert.match(patch, /thinking: enabled/);
+    assert.match(patch, /reasoningEffort: off/);
     const config = patch.split('\n').filter((line) => !line.trim().startsWith('#')).join('\n');
     assert.doesNotMatch(config, /openai-completions/);
     assert.doesNotMatch(config, /deepseek-contest/);
     assert.doesNotMatch(config, /api:\s*anthropic/);
     assert.match(patch, /mode: danger-full-access/);
     assert.match(patch, /policy: never/);
+    for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
+      assert.match(patch, new RegExp(`id: ${id}\\n  disabled: false`));
+    }
+    assert.match(patch, /binaryPath: \/opt\/dsh-ops\/bin\/fastctx/);
   }
 });
 

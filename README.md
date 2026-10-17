@@ -335,7 +335,7 @@ stdout 一行 JSON：`status` 为 `seeded` 或 `already-seeded`。
 
 ### 镜像
 
-示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。这个示例骨架不安装 dsh，也不安装 dsh-ops。它把仓库里的 `profiles/contest-baseline` 和 `profiles/contest` 拷到 `$DSH_HOME/profiles/`（这两份仍是 `thinking: disabled`），并把默认 profile 设成 `contest-baseline`。`docker build -f contest/Dockerfile` 得到的镜像与下面的正式包是两份东西。正式 tarball 见「[正式竞赛镜像（Release）](#contest-image-release)」。上传页环境见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)。
+示例见 `contest/Dockerfile`：`ENTRYPOINT ["contest/entrypoint.sh"]`。构建上下文不要把密钥拷进去。上传仍是 `docker save … | gzip`，上限 3GB。这个示例骨架不安装 dsh，也不安装 dsh-ops。它把仓库里的 `profiles/contest-baseline` 和 `profiles/contest` 拷到 `$DSH_HOME/profiles/`（这两份是 `thinking: enabled`，并声明 `dsh-ops-shell` / `dsh-ops-file` / `dsh-ops-background` / `dsh-ops-ptc` 均为 `disabled: false`），并把默认 profile 设成 `contest-baseline`。`docker build -f contest/Dockerfile` 得到的镜像与下面的正式包是两份东西。正式 tarball 见「[正式竞赛镜像（Release）](#contest-image-release)」。上传页环境见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)。
 
 ```bash
 docker build -f contest/Dockerfile -t fgs-contest .
@@ -357,7 +357,7 @@ node --test tests/bootstrap_project.test.mjs tests/contest_driver.test.mjs tests
 - dsh-ops：[v0.3.1](https://github.com/T-Auto/dsh-ops/releases/tag/v0.3.1)。四个组件都开着：`dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc`。烟囱里点过名的工具是 `ops_bash`、`ops_glob`、`ops_inspect_local_file`。`contest-baseline` 和 `contest` 都有这些 ops 工具；只有 `contest` 有 FGS。
 - Messages 仍是 `deepseek-official` + `https://api.deepseek.com/anthropic`。这份镜像上 **`thinking: enabled`**。dsh 0.2.1-rc.2 在 `thinking: disabled` 时会 TRANSPORT 失败。
 
-本仓库的 `profiles/contest/cordis.patch.yml` 和 `profiles/contest-baseline/cordis.patch.yml` 仍写 `thinking: disabled`，也没有 dsh-ops。`contest/Dockerfile` 是示例骨架：不安装 dsh，也不安装 dsh-ops，拷贝的是仓库里的这两份 profile。`docker build -f contest/Dockerfile` 不会得到上面的 `agent.tar.gz`。dsh-ops 不是 `@local/fgs-deepseek-dsh` 的依赖，也不是 npm 包。`dsh plugin add` 本仓库不会装上它。
+本仓库的 `profiles/contest/cordis.patch.yml` 和 `profiles/contest-baseline/cordis.patch.yml` 都是 `thinking: enabled`，并把 `dsh-ops-shell`、`dsh-ops-file`、`dsh-ops-background`、`dsh-ops-ptc` 写成 `disabled: false`。两份 profile 的 `package.json` 都把 `dsh-ops` 放进 `bundles`，依赖为 `file:/opt/dsh-ops`，这条路径只在正式镜像里解析。在 `profiles/contest` 或 `profiles/contest-baseline` 里跑 `npm install`，没有 `/opt/dsh-ops` 会失败，和没有 `/opt/fgs-v4` 时一样。`contest/Dockerfile` 是示例骨架：不安装 dsh，也不安装 dsh-ops，拷贝的是仓库里的这两份 profile。`docker build -f contest/Dockerfile` 不会得到上面的 `agent.tar.gz`。dsh-ops 不是 `@local/fgs-deepseek-dsh` 的依赖，也不是 npm 包。`dsh plugin add` 本仓库不会装上它。
 
 ## 契约对照
 
