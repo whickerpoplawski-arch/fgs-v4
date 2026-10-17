@@ -130,6 +130,23 @@ test('buildInjectText carries 轻约束 / ≤2 and optional 环打断 / 三锚',
   assert.equal(L3_ANCHORS.includes('反跑题'), true);
 });
 
+test('L1 is a one-line operational ≤2 then tool_call contract without language bans', () => {
+  assert.equal(L1_CONTRACT.includes('\n'), false);
+  assert.match(L1_CONTRACT, /≤2/);
+  assert.match(L1_CONTRACT, /tool_call/);
+  assert.match(L1_CONTRACT, /无文字/);
+  assert.match(L1_CONTRACT, /本题结束|收尾/);
+  assert.doesNotMatch(L1_CONTRACT, /默认中文/);
+  assert.doesNotMatch(L1_CONTRACT, /I'll start/);
+  assert.doesNotMatch(L1_CONTRACT, /Let me/);
+  const l1 = buildInjectText({ notes: true, loopBreak: false, anchors: false });
+  assert.doesNotMatch(l1, /默认中文/);
+  assert.doesNotMatch(l1, /I'll start/);
+  assert.doesNotMatch(l1, /Let me/);
+  assert.equal(L2_BREAK, '【环打断】你已连续重复相近步骤。换攻击面或脚本化；用 record_observation 记已排除路径。');
+  assert.equal(L3_ANCHORS, '【锚】回顾：上一工具结果一句话。收敛：本步唯一动作。反跑题：不写讲义。');
+});
+
 test('loop detector trips after N similar fingerprints', () => {
   const n = 3;
   const fp = fingerprintText('curl http://10.0.0.8/login -d a=1', 't');
