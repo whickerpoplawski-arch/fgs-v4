@@ -16,6 +16,9 @@
 # image. Until dsh is on PATH the driver records a launch stub. FGS pre-seed
 # runs only for the contest profile.
 #
+# Contest profiles do not bundle dsh-ops. This skeleton does not install
+# /opt/dsh-ops. Shell and file access stay on stock dsh tools.
+#
 # The driver also runs the contest supervisor (reap / retire / dual-guard).
 # Do not add a second autosup process to this image.
 #

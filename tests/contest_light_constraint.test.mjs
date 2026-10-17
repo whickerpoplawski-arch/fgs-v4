@@ -338,18 +338,16 @@ test('baseline profile still has no FGS bundle after light-constraint landing', 
   assert.deepEqual(baseline.dsh.profile.bundles, [
     '@deepseek-ai/dsh-base',
     '@deepseek-ai/dsh-headless',
-    'dsh-ops',
     '@local/contest-benchmark-tools',
   ]);
   assert.equal(baseline.dependencies['@local/fgs-deepseek-dsh'], undefined);
+  assert.equal(baseline.dependencies['dsh-ops'], undefined);
+  assert.equal(contest.dependencies['dsh-ops'], undefined);
   assert.ok(contest.dsh.profile.bundles.includes('@local/contest-benchmark-tools'));
+  assert.equal(contest.dsh.profile.bundles.includes('dsh-ops'), false);
   const patch = fs.readFileSync(path.join(repoRoot, 'profiles', 'contest-baseline', 'cordis.patch.yml'), 'utf8');
   assert.match(patch, /thinking: enabled/);
-  assert.doesNotMatch(patch, /dsh-routing-suite|fgs-deepseek-dsh|graded|super-injector/);
-  for (const id of ['dsh-ops-shell', 'dsh-ops-file', 'dsh-ops-background', 'dsh-ops-ptc']) {
-    assert.match(patch, new RegExp(`id: ${id}\\n  disabled: false`));
-  }
-  assert.match(patch, /binaryPath: \/opt\/dsh-ops\/bin\/fastctx/);
+  assert.doesNotMatch(patch, /dsh-routing-suite|fgs-deepseek-dsh|graded|super-injector|dsh-ops|ops_bash|ops_glob|ops_inspect_local_file/);
 });
 
 test('pre-step writes a monotonic .fgs/dsh_step_count and leaves a missing file alone', async () => {
