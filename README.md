@@ -92,7 +92,7 @@ Installing this plugin into a profile bundle only provides the **FGS tools and t
 TSecBench 托管容器在插件之外还要：
 
 - **ENTRYPOINT** [`contest/entrypoint.sh`](contest/entrypoint.sh)。它 exec `contest/driver.py`：`list` → `start` →（仅 FGS profile）磁盘预种 → Solver 任务书 → `dsh --profile <contest-baseline|contest>`。baseline 不预种。FGS 预种在任何模型回合之前完成。
-- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`、`CONTEST_FGS_MODE=on_fail`。新题用 `contest-baseline`。只有失败题的二遍用 `contest`。不热挂载，不为切换杀正在跑的 worker。`CONTEST_FGS_AFTER_SEC` 只在 `mode=after_sec` 时生效。
+- 环境变量：`CONTEST_SUPERVISOR=1`、`CONTEST_DSH_LAUNCH=1`、`SOLVER_GATEWAY=1`、`CONTEST_FGS_MODE=on_fail`。新题用 `contest-baseline`。只有失败题的二遍用 `contest`。不热挂载，不为切换杀正在跑的 worker。`CONTEST_FGS_AFTER_SEC` 只在 `mode=after_sec` 时换 profile。`CONTEST_FGS_RELAX_RETRY_AFTER_SEC` 缺省 off；设成秒数后，到点才允许 FGS 与新题并行。
 - **不要设置** `BENCHMARK_*`，也不要在上传页写全局 `FGS_UNIQUE_CODE`。`BENCHMARK_TOKEN` / `BENCHMARK_BASE_URL` 由平台在运行时注入。
 - **交 flag**：baseline 走 `benchmark_submit_flag`（同一 POST submit）。FGS 插件仍保持 `verifyMode: command`。driver 按题注入 `FGS_UNIQUE_CODE`。
 - 竞赛 profile 用 **stock Messages**：`provider: deepseek-official`，`baseURL: https://api.deepseek.com/anthropic`。`SOLVER_GATEWAY=1` 只改写模型基址（`https://api.deepseek.com/anthropic` → `http://api.deepseek.com.tsecbench.gw/anthropic`），不改 `BENCHMARK_*` 和 Challenges API。不要把 `deepseek-official` 配成 `openai-completions`。
@@ -294,8 +294,9 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 | `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 `--profile`。含 FGS + `benchmark_*` |
 | `CONTEST_FGS_MODE` | `on_fail` | 新题保持 baseline。失败（进程已死、deferred 过宽限、一遍步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或可选墙钟预算）才 FIFO 二遍。`after_sec` 是旧墙钟且不重试。`off` 永不 FGS |
 | `CONTEST_CHALLENGE_MAX_STEPS` | `0` | 一遍 pre-step 上限。`0` 关。`> N` 才入失败队。上传推荐 `100`。FGS 二遍不吃这个上限，也不吃 `CONTEST_FAIL_ON_BUDGET` |
-| `CONTEST_FGS_AFTER_SEC` | `7200` | **仅 `mode=after_sec`。** `on_fail` 忽略。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
-| `CONTEST_FGS_RETRY_LAST` | `1` | 有新题时不跑 FGS |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | **仅 `mode=after_sec` 换 profile。** `on_fail` 忽略，不会因此并行 FGS。`0` 立刻全 FGS。`off` / 负数一直 baseline。不杀已运行 worker |
+| `CONTEST_FGS_RELAX_RETRY_AFTER_SEC` | off | **仅 `mode=on_fail` 放宽 `RETRY_LAST`。** 缺省不放宽。`1800` 为上传推荐：满 30 分钟后本 tick 允许 FGS 与新题并行，仍受 `CONTEST_FGS_MAX_ACTIVE`。不改一遍 profile。非数字启动失败 |
+| `CONTEST_FGS_RETRY_LAST` | `1` | 有新题时不跑 FGS，除非 `CONTEST_FGS_RELAX_RETRY_AFTER_SEC` 已到点 |
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
 | `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数 |
 | `CONTEST_SKIP_FGS_SEED` | `auto` | 仅 FGS profile 预种。baseline 跳过 bootstrap。二遍在预种后按 baseline 产物补图 |
@@ -320,7 +321,7 @@ P0 做法是磁盘预种：每题 `start` 成功后、拉起 dsh **之前**，�
 1. `list_challenges`（跳过已通关）
 2. `POST {prefix}/challenges/start?unique_code={code}`（query，body `{}`；`prefix` 用 list 成功的那个，托管是 `/openapi/v1`）→ `container_addr`。失败或地址为空：**不** bootstrap、**不** 拉 dsh
 3. `mkdir $CONTEST_WORKDIR/<problemId>/`（id 规范成 `[a-z0-9_-]{1,64}`，与 `ProjectRegistry.normalizeId` 相同）
-4. 按本遍选 profile（`profile_for_visit`）。默认 `on_fail`：新题用 `contest-baseline`，忽略 `CONTEST_FGS_AFTER_SEC`。失败二遍才用 `contest`。`mode=after_sec` 才按 driver 启动时钟走旧的 `profile_for_now`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。二遍还会把 baseline 产物补成 Fact / Intent（`tools/apply_enrich.mjs`）
+4. 按本遍选 profile（`profile_for_visit`）。默认 `on_fail`：新题用 `contest-baseline`，忽略 `CONTEST_FGS_AFTER_SEC`。`CONTEST_FGS_RELAX_RETRY_AFTER_SEC` 到点只放宽「能不能派 FGS」，不改这一步的 profile。失败二遍才用 `contest`。`mode=after_sec` 才按 driver 启动时钟走旧的 `profile_for_now`。baseline **不**跑 bootstrap。FGS profile 才执行 `node tools/bootstrap_project.mjs --cwd <该目录> --problem-id <id> --brief <description + addr> --target <addr> --criterion '取得有效 flag 并 submit correct=true'`，并验收 `.fgs/competition.json` 的 `activeProblemId` 以及 `projects/<id>/graph.yaml` 含 `fact_origin` 和 `goal_final`。二遍还会把 baseline 产物补成 Fact / Intent（`tools/apply_enrich.mjs`）
 5. 把对手 Solver 任务书写入 `prompt.txt`（纪律段逐字，题目块来自 list/start）。两边都写这份任务书。任务书含输出纪律：工具调用前可见文字 ≤2 句，通关后只交 flag 加一句结论。运行时轻约束（`agent/pre-step` 注入，不是新 tool）见 [`contest/UPLOAD_ENV.md`](contest/UPLOAD_ENV.md)「Baseline 轻约束」。
 6. 拉起 `dsh --profile <选中的 profile> --json prompt.txt`（cwd = 该目录），环境注入 `FGS_UNIQUE_CODE=<unique_code>`（与 start/close 题号相同，不改 `BENCHMARK_*`）。harness 未装时写 launch stub。`.fgs/dsh-launch.json` 记录 `protocol: anthropic_messages`、`provider: deepseek-official` 和选中的 profile
 

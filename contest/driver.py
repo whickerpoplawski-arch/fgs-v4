@@ -11,6 +11,9 @@ The default mode (``CONTEST_FGS_MODE=on_fail``) keeps every new challenge on
 that baseline. A challenge gets profile ``contest`` only on a later FGS pass,
 after the narrow fail rule puts it on the FIFO retry queue. ``after_sec`` keeps
 the old wall-clock switch (``CONTEST_FGS_AFTER_SEC``) and does not retry.
+``CONTEST_FGS_RELAX_RETRY_AFTER_SEC`` (default off) is a separate on_fail
+latch: after that many seconds from driver start, a tick may dispatch one FGS
+visit beside new work. It does not change the profile of a first pass.
 The choice is per new worker. A running worker is not hot-swapped and is not
 killed to change profiles.
 
@@ -74,7 +77,8 @@ from fail_queue import (
     fgs_max_active,
     fgs_max_retries,
     fgs_mode,
-    fgs_retry_last,
+    fgs_relax_retry_after_sec,
+    format_relax_tick,
     list_unclassified,
     mark_first_pass_done,
     mark_first_pass_started,
@@ -86,6 +90,7 @@ from fail_queue import (
     queue_new,
     read_step_count,
     register_fail,
+    retry_last_for_tick,
     safe_code,
     select_dispatch,
     snapshot_artifacts,
@@ -1536,6 +1541,7 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
             fgs_live = sum(
                 1 for slot in slots if slot.get("pass_kind") == "fgs" and slot_view(slot)["alive"]
             )
+            elapsed = driver_elapsed()
             plans = select_dispatch(
                 challenges,
                 run=run,
@@ -1545,14 +1551,14 @@ def supervisor_loop(run: Path, workdir: Path, token: str, base: str, fixture_pat
                 alive=alive,
                 active=active,
                 cap=cap,
-                retry_last=fgs_retry_last(),
+                retry_last=retry_last_for_tick(elapsed),
                 fgs_max_active=fgs_max_active(),
                 max_retries=retries,
                 list_failed=list_failed,
             )
             queue_len = new_n + fgs_n
             budget = len(plans)
-            tick_extra = f" queue_new={new_n} queue_fgs={fgs_n}"
+            tick_extra = f" queue_new={new_n} queue_fgs={fgs_n} {format_relax_tick(elapsed)}"
         else:
             queue = pending_queue(challenges, attempted, inflight)
             queue_len = len(queue)
@@ -1645,6 +1651,8 @@ def main(argv: list[str] | None = None) -> int:
     del argv  # reserved; the visit order is driven by env + the platform, not flags
     mark_driver_started()
     try:
+        # Reject a bad relax gate before the first tick, including supervisor off.
+        fgs_relax_retry_after_sec()
         require_platform_env()
         # Capture the injected Challenges endpoint before any gateway rewrite.
         # apply_gateway_rewrites must not touch these; the snapshot is what list,

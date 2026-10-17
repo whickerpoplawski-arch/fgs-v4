@@ -94,6 +94,232 @@ test('mode=off never selects the FGS profile; mode=after_sec still uses the wall
   assert.match(legacy.stderr, /elapsed=7200\.0 FGS_AFTER=7200 → contest \(FGS on\)/);
 });
 
+test('retry_last_for_tick relaxes at the gate without sleeping or switching profile', () => {
+  const script = `
+import json, os, tempfile
+from datetime import datetime, timezone
+from pathlib import Path
+from fail_queue import (
+    format_relax_tick, fgs_relax_retry_after_sec, register_fail,
+    retry_last_for_tick, select_dispatch,
+)
+
+KEYS = (
+    "CONTEST_FGS_MODE",
+    "CONTEST_FGS_RETRY_LAST",
+    "CONTEST_FGS_RELAX_RETRY_AFTER_SEC",
+    "CONTEST_FGS_AFTER_SEC",
+)
+
+def apply(env):
+    for key in KEYS:
+        os.environ.pop(key, None)
+    for key, value in env.items():
+        os.environ[key] = value
+
+def flag(env, elapsed):
+    apply(env)
+    return retry_last_for_tick(elapsed)
+
+base = {"CONTEST_FGS_MODE": "on_fail", "CONTEST_FGS_RETRY_LAST": "1"}
+apply({**base, "CONTEST_FGS_AFTER_SEC": "0"})
+ignored_gate = fgs_relax_retry_after_sec()
+apply({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800", "CONTEST_FGS_AFTER_SEC": "7200"})
+before_tick = format_relax_tick(1799)
+at_tick = format_relax_tick(1800)
+apply({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "soon"})
+bad = ""
+try:
+    fgs_relax_retry_after_sec()
+except Exception as exc:
+    bad = str(exc)
+
+run = Path(tempfile.mkdtemp())
+register_fail(
+    run,
+    unique_code="old-1",
+    reason="steps",
+    artifact_dir="",
+    now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+)
+challenges = [
+    {"unique_code": "fresh-1", "is_completed": False, "description": "new"},
+    {"unique_code": "old-1", "is_completed": False, "description": "failed"},
+]
+common = dict(
+    run=run, inflight=set(), blocked=set(), fgs_inflight=0, alive=0, active=0,
+    cap=3, fgs_max_active=1, max_retries=1, list_failed=False,
+)
+apply({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800"})
+held = [item["pass_kind"] for item in select_dispatch(challenges, retry_last=retry_last_for_tick(1799), **common)]
+opened = [item["pass_kind"] for item in select_dispatch(challenges, retry_last=retry_last_for_tick(1800), **common)]
+
+print(json.dumps({
+    "ignored_gate": ignored_gate,
+    "after_sec_zero": flag({**base, "CONTEST_FGS_AFTER_SEC": "0"}, 99999),
+    "unset": flag(base, 99999),
+    "blank": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "  "}, 99999),
+    "off": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "off"}, 99999),
+    "never": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "never"}, 99999),
+    "negative": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "-5"}, 99999),
+    "before": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800"}, 1799.9),
+    "at": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800"}, 1800),
+    "after": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800"}, 1801),
+    "zero": flag({**base, "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "0"}, 0),
+    "already": flag({"CONTEST_FGS_MODE": "on_fail", "CONTEST_FGS_RETRY_LAST": "0", "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "1800"}, 0),
+    "other_mode": flag({"CONTEST_FGS_MODE": "after_sec", "CONTEST_FGS_RETRY_LAST": "1", "CONTEST_FGS_RELAX_RETRY_AFTER_SEC": "0"}, 99999),
+    "before_tick": before_tick,
+    "at_tick": at_tick,
+    "bad": bad,
+    "held": held,
+    "opened": opened,
+}))
+`;
+  const { body } = pyJson(script);
+  assert.equal(body.ignored_gate, null);
+  assert.equal(body.after_sec_zero, true);
+  assert.equal(body.unset, true);
+  assert.equal(body.blank, true);
+  assert.equal(body.off, true);
+  assert.equal(body.never, true);
+  assert.equal(body.negative, true);
+  assert.equal(body.before, true);
+  assert.equal(body.at, false);
+  assert.equal(body.after, false);
+  assert.equal(body.zero, false);
+  assert.equal(body.already, false);
+  assert.equal(body.other_mode, true);
+  assert.equal(body.before_tick, 'relax_at=1800 retry_last=1');
+  assert.equal(body.at_tick, 'relax_at=1800 retry_last=relaxed');
+  assert.match(body.bad, /CONTEST_FGS_RELAX_RETRY_AFTER_SEC is not a number: soon/);
+  assert.deepEqual(body.held, ['first']);
+  assert.deepEqual(body.opened, ['first', 'fgs']);
+});
+
+function seedFailBesideNew(scratch) {
+  const workdir = path.join(scratch, 'work');
+  const run = path.join(scratch, 'run');
+  fs.mkdirSync(path.join(run, 'queue', 'failed'), { recursive: true });
+  fs.mkdirSync(path.join(run, 'queue', 'first_pass_done'), { recursive: true });
+  fs.writeFileSync(path.join(run, 'queue', 'failed', 'old-1.json'), `${JSON.stringify({
+    unique_code: 'old-1',
+    failed_at: '2026-01-01T00:00:00Z',
+    reason: 'steps',
+    artifact_dir: '',
+    attempt: 1,
+    fgs_attempts: 0,
+  })}\n`);
+  fs.writeFileSync(path.join(run, 'queue', 'first_pass_done', 'old-1'), 'old-1\n');
+  const fixture = writeFixture(scratch, [
+    {
+      unique_code: 'fresh-1',
+      description: 'still new',
+      is_completed: false,
+      container_addr: ['http://10.9.0.2'],
+    },
+    {
+      unique_code: 'old-1',
+      description: 'already failed',
+      is_completed: false,
+      container_addr: ['http://10.9.0.3'],
+    },
+  ]);
+  return { workdir, run, fixture };
+}
+
+function firstTickLine(stderr) {
+  const start = stderr.indexOf('supervisor tick');
+  assert.ok(start >= 0, stderr);
+  return stderr.slice(start).split('\n')[0];
+}
+
+test('AFTER_SEC=0 with RETRY_LAST=1 does not relax while new work remains', () => {
+  const scratch = tmpDir('fgs-relax-hold-');
+  const seeded = seedFailBesideNew(scratch);
+  const result = runPython([driver], {
+    BENCHMARK_TOKEN: 'test-token',
+    BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+    CONTEST_FIXTURE: seeded.fixture,
+    CONTEST_WORKDIR: seeded.workdir,
+    RUN: seeded.run,
+    CONTEST_DSH_LAUNCH: '0',
+    CONTEST_SUPERVISOR: '1',
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    CONTEST_MAX_ACTIVE: '3',
+    CONTEST_FGS_MODE: 'on_fail',
+    CONTEST_FGS_AFTER_SEC: '0',
+    CONTEST_FGS_RETRY_LAST: '1',
+    CONTEST_FGS_RELAX_RETRY_AFTER_SEC: 'off',
+    CONTEST_SKIP_FGS_SEED: '1',
+    SOLVER_GATEWAY: '0',
+  });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const tick = firstTickLine(result.stderr);
+  assert.match(tick, /queue_new=1 queue_fgs=1 relax_at=off retry_last=1/);
+  assert.match(tick, /budget=1\b/);
+  assert.match(result.stderr, /FGS_AFTER=ignored mode=on_fail/);
+  assert.match(result.stderr, /visit fresh-1 .* pass=first/);
+  assert.match(result.stderr, /pass=fgs mode=on_fail/);
+  assert.doesNotMatch(result.stderr, /FGS_AFTER=0 → contest/);
+  assert.doesNotMatch(result.stderr, /retry_last=relaxed/);
+  const passes = fs.readFileSync(path.join(seeded.workdir, 'fresh-1', '.contest', 'passes.jsonl'), 'utf8');
+  assert.match(passes, /"pass": "first"/);
+  assert.match(passes, /contest-baseline/);
+  assert.doesNotMatch(passes, /"pass": "fgs"/);
+});
+
+test('RELAX_RETRY_AFTER_SEC=0 dispatches FGS beside a new challenge on the first tick', () => {
+  const scratch = tmpDir('fgs-relax-open-');
+  const seeded = seedFailBesideNew(scratch);
+  const result = runPython([driver], {
+    BENCHMARK_TOKEN: 'test-token',
+    BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+    CONTEST_FIXTURE: seeded.fixture,
+    CONTEST_WORKDIR: seeded.workdir,
+    RUN: seeded.run,
+    CONTEST_DSH_LAUNCH: '0',
+    CONTEST_SUPERVISOR: '1',
+    CONTEST_SUPERVISOR_INTERVAL: '0',
+    CONTEST_MAX_ACTIVE: '3',
+    CONTEST_FGS_MODE: 'on_fail',
+    CONTEST_FGS_AFTER_SEC: '7200',
+    CONTEST_FGS_RETRY_LAST: '1',
+    CONTEST_FGS_RELAX_RETRY_AFTER_SEC: '0',
+    CONTEST_SKIP_FGS_SEED: '1',
+    SOLVER_GATEWAY: '0',
+  });
+  assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`);
+  const tick = firstTickLine(result.stderr);
+  assert.match(tick, /queue_new=1 queue_fgs=1 relax_at=0 retry_last=relaxed/);
+  assert.match(tick, /budget=2\b/);
+  assert.equal((result.stderr.match(/pass=fgs mode=on_fail/g) || []).length, 1);
+  assert.match(result.stderr, /pass=first elapsed=.* FGS_AFTER=ignored mode=on_fail → contest-baseline \(FGS off\)/);
+  assert.match(result.stderr, /visit fresh-1 .* pass=first/);
+  assert.match(result.stderr, /pass=fgs mode=on_fail → contest \(FGS on\)/);
+  assert.doesNotMatch(result.stderr, /FGS_AFTER=0 → contest/);
+  assert.doesNotMatch(result.stderr, /FGS_AFTER=7200 → contest/);
+  const fresh = fs.readFileSync(path.join(seeded.workdir, 'fresh-1', '.contest', 'passes.jsonl'), 'utf8');
+  const old = fs.readFileSync(path.join(seeded.workdir, 'old-1', '.contest', 'passes.jsonl'), 'utf8');
+  assert.match(fresh, /"pass": "first"/);
+  assert.match(fresh, /contest-baseline/);
+  assert.match(old, /"pass": "fgs"/);
+  assert.match(old, /"profile": "contest"/);
+});
+
+test('a non-numeric relax gate fails at driver startup', () => {
+  const result = runPython([driver], {
+    BENCHMARK_TOKEN: 'test-token',
+    BENCHMARK_BASE_URL: 'http://benchmark.invalid',
+    CONTEST_SUPERVISOR: '0',
+    CONTEST_FGS_MODE: 'on_fail',
+    CONTEST_FGS_AFTER_SEC: '7200',
+    CONTEST_FGS_RELAX_RETRY_AFTER_SEC: 'soon',
+  });
+  assert.equal(result.status, 1, `${result.stderr}\n${result.stdout}`);
+  assert.match(result.stderr, /CONTEST_FGS_RELAX_RETRY_AFTER_SEC is not a number: soon/);
+  assert.doesNotMatch(result.stderr, /supervisor tick/);
+});
+
 test('fail rule, FIFO, retry-last, max active, and solved exclusion', () => {
   const scratch = tmpDir('fgs-fail-queue-');
   const script = `

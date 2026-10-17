@@ -82,6 +82,69 @@ def fgs_retry_last() -> bool:
     return env_bool("CONTEST_FGS_RETRY_LAST", True)
 
 
+_RELAX_OFF = frozenset({"off", "never", "false", "no"})
+
+
+def fgs_relax_retry_after_sec() -> float | None:
+    """Seconds from driver start before ``on_fail`` may pair FGS with new work.
+
+    Unset, empty, negative, or ``off`` / ``never`` / ``false`` / ``no``: never
+    relax (keep ``CONTEST_FGS_RETRY_LAST``). ``0`` relaxes on the first tick.
+    A positive number is the gate. Anything else raises. This does not read
+    ``CONTEST_FGS_AFTER_SEC`` and does not select a profile.
+    """
+    raw = os.environ.get("CONTEST_FGS_RELAX_RETRY_AFTER_SEC")
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text or text.lower() in _RELAX_OFF:
+        return None
+    try:
+        value = float(text)
+    except ValueError as exc:
+        raise SupervisorError(
+            f"CONTEST_FGS_RELAX_RETRY_AFTER_SEC is not a number: {text}"
+        ) from exc
+    if value < 0:
+        return None
+    return value
+
+
+def retry_last_for_tick(elapsed: float) -> bool:
+    """Effective ``retry_last`` for one ``on_fail`` tick.
+
+    ``False`` when ``CONTEST_FGS_RETRY_LAST`` is already off, or when
+    ``elapsed`` has reached ``CONTEST_FGS_RELAX_RETRY_AFTER_SEC``. Before the
+    gate, the configured flag stands. Other modes do not relax. Callers pass
+    ``elapsed``; this does not sleep or read the process clock.
+    """
+    if not fgs_retry_last():
+        return False
+    if fgs_mode() != "on_fail":
+        return True
+    after = fgs_relax_retry_after_sec()
+    if after is None:
+        return True
+    return float(elapsed) < after
+
+
+def format_relax_tick(elapsed: float) -> str:
+    """Supervisor-tick suffix. Profile lines stay ``FGS_AFTER=ignored``."""
+    after = fgs_relax_retry_after_sec()
+    effective = retry_last_for_tick(elapsed)
+    if after is None:
+        gate = "off"
+    elif after.is_integer():
+        gate = str(int(after))
+    else:
+        gate = f"{after:g}"
+    if fgs_retry_last() and not effective:
+        flag = "relaxed"
+    else:
+        flag = "1" if effective else "0"
+    return f"relax_at={gate} retry_last={flag}"
+
+
 def fgs_max_retries() -> int:
     """How many FGS passes one challenge may start. ``0`` dispatches none."""
     return env_int_default("CONTEST_FGS_MAX_RETRIES", 1, minimum=0)

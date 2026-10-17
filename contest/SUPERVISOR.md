@@ -15,7 +15,7 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 1. **reap** — 容器仍是 `available` / `pending` / `stop_pending`，或本进程启动过的 worker 已经退出，且没有存活 pid → `close` 一次。有存活 pid → 留下。
 2. **retire** — 存活 worker 的 meta 是 `deferred` 或 `solved`，或平台 `is_completed`。过宽限后 `SIGTERM`，仍在则 `SIGKILL`，然后 `close`。平台已通关但 meta 还不是 `solved` 用短宽限（默认 30 秒），其余默认 60 秒。`solved`（含平台对账）会把 worker 目录归档为 `_done_*`。`on_fail` 下还可选：一遍步数超过 `CONTEST_CHALLENGE_MAX_STEPS`，或 `CONTEST_FAIL_ON_BUDGET=1` 时墙钟超过预算。这两条只打 `pass_kind=first`。FGS 二遍不因步数或墙钟 retire。
 3. **gc** — `monitor_sampler.sh loop` 的 `SESSION_ID` 不属于存活 worker 时杀掉。
-4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才补人。默认 `CONTEST_FGS_MODE=on_fail` 时先派未做过一遍的新题（profile `contest-baseline`，不预种）。新题没有了，才按 `failed_at` 从早到晚派失败题的二遍（profile `contest`，预种并补图），同时活着的 FGS worker 不超过 `CONTEST_FGS_MAX_ACTIVE`。`CONTEST_FGS_RETRY_LAST=1` 时，只要还有新题，这一轮就不派 FGS。列表失败时按活跃容器已满处理，不补派，也不把题写进失败队列。
+4. **补派** — `alive_workers < CONTEST_MAX_ACTIVE` **并且** `active_containers < CONTEST_MAX_ACTIVE` 才补人。默认 `CONTEST_FGS_MODE=on_fail` 时先派未做过一遍的新题（profile `contest-baseline`，不预种）。新题没有了，才按 `failed_at` 从早到晚派失败题的二遍（profile `contest`，预种并补图），同时活着的 FGS worker 不超过 `CONTEST_FGS_MAX_ACTIVE`。`CONTEST_FGS_RETRY_LAST=1` 时，只要还有新题，这一轮就不派 FGS。`CONTEST_FGS_RELAX_RETRY_AFTER_SEC` 从 driver 进程启动起算，到点后这一轮改为允许 FGS 与新题并行（仍不超过 `CONTEST_FGS_MAX_ACTIVE`）。缺省 off，不放宽。不改一遍 profile，不杀已在跑的 baseline。列表失败时按活跃容器已满处理，不补派，也不把题写进失败队列。
 
 平台 list / start / close 的 HTTP 超时或连接中断只打 `contest:` 日志，driver 继续下一轮。close 没拿到响应时不写入已关集合，下一轮再试。这类毛刺 **不是** 失败，不会入 FGS 队。close 超时不是失分（已经 submit 的分数还在）；这个异常如果冒出主循环，整条 launch/submit 流水线会停。
 
@@ -54,8 +54,9 @@ A profile-bundle install does not run reap / retire. See README 「托管容器�
 | `CONTEST_DSH_PROFILE` | `contest-baseline` | 新题一遍的 profile。无 FGS bundle |
 | `CONTEST_DSH_PROFILE_FGS` | `contest` | 失败二遍的 profile。含 FGS。不改已经在跑的 worker |
 | `CONTEST_FGS_MODE` | `on_fail` | `on_fail` 推荐。`after_sec` 保留 PR#12 墙钟且不重试失败题。`off` 永不 FGS |
-| `CONTEST_FGS_AFTER_SEC` | `7200` | **只在 `mode=after_sec` 时生效。** `on_fail` 忽略。`0` 立刻全用 FGS profile。负数或 `off` / `never` / `false` / `no` 则一直用 baseline。不热挂载，也不为切换杀进程 |
-| `CONTEST_FGS_RETRY_LAST` | `1` | `1`：有新题就不跑 FGS。`0`：可以和新题同一轮并行，仍受下面的上限 |
+| `CONTEST_FGS_AFTER_SEC` | `7200` | **只在 `mode=after_sec` 时换 profile。** `on_fail` 忽略，不会因此并行 FGS。`0` 立刻全用 FGS profile。负数或 `off` / `never` / `false` / `no` 则一直用 baseline。不热挂载，也不为切换杀进程 |
+| `CONTEST_FGS_RELAX_RETRY_AFTER_SEC` | off | **只在 `mode=on_fail` 时放宽 `RETRY_LAST`。** 不设、空、负数、或 `off` / `never` / `false` / `no`：不放宽。`0`：第一轮起并行。正数：elapsed ≥ T 后本 tick 允许 FGS 与新题并行，仍受 `CONTEST_FGS_MAX_ACTIVE`。时钟从 driver 进程启动起算。不改 profile。非数字启动失败。上传推荐 `1800` |
+| `CONTEST_FGS_RETRY_LAST` | `1` | `1`：有新题就不跑 FGS，除非上面的门闩已到点。`0`：可以和新题同一轮并行，仍受下面的上限 |
 | `CONTEST_FGS_MAX_ACTIVE` | `1` | 同时 FGS worker 上限 |
 | `CONTEST_FGS_MAX_RETRIES` | `1` | 每题 FGS 遍数。用尽后写 `fgs_done` |
 | `CONTEST_FAIL_ON_BUDGET` | 关 | `1` 才把「活过墙钟预算仍未通关」的**一遍**当失败。默认关。FGS 二遍忽略 |
@@ -87,6 +88,7 @@ CONTEST_FGS_MAX_ACTIVE=1
 CONTEST_FGS_MAX_RETRIES=1
 SOLVER_GATEWAY=1
 DEEPSEEK_BASE_URL=https://api.deepseek.com/anthropic
+# 上传页另写 CONTEST_FGS_RELAX_RETRY_AFTER_SEC=1800（镜像缺省 off：有新题时不并行 FGS）
 # 上传页另写 CONTEST_CHALLENGE_MAX_STEPS=100（代码默认 0；不写则不按步数腾槽）
 # + BENCHMARK_TOKEN / BENCHMARK_BASE_URL / DEEPSEEK_API_KEY（运行时注入，勿进镜像）
 # 协议：stock Messages（deepseek-official）。不要把该 id patch 成 openai-completions。

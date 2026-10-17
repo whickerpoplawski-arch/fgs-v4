@@ -38,6 +38,8 @@ RUN chmod +x contest/entrypoint.sh contest/supervisor/*.sh \
 # Messages root is /anthropic, not the chat /v1 root (that path 404s).
 # New challenges stay on contest-baseline. FGS is the fail-retry pass.
 # CONTEST_FGS_AFTER_SEC is ignored unless CONTEST_FGS_MODE=after_sec.
+# CONTEST_FGS_RELAX_RETRY_AFTER_SEC=off does not pair FGS with new work.
+# The upload page sets 1800 for that on_fail gate. Do not reuse AFTER_SEC=7200.
 ENV CONTEST_WORKDIR=/var/lib/fgs-contest \
     DSH_HOME=/opt/dsh \
     DSH_PERMISSION_MODE=danger-full-access \
@@ -47,6 +49,7 @@ ENV CONTEST_WORKDIR=/var/lib/fgs-contest \
     CONTEST_DSH_PROFILE_FGS=contest \
     CONTEST_FGS_MODE=on_fail \
     CONTEST_FGS_AFTER_SEC=7200 \
+    CONTEST_FGS_RELAX_RETRY_AFTER_SEC=off \
     CONTEST_FGS_RETRY_LAST=1 \
     CONTEST_FGS_MAX_ACTIVE=1 \
     CONTEST_FGS_MAX_RETRIES=1 \
